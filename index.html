@@ -200,6 +200,9 @@ function note(text) {
   $('log').textContent = lines.join('\n');
 }
 const why = (error) => (error && (error.message || error.name)) || String(error);
+// Nothing fails unseen: any error the page did not catch goes into the log too.
+addEventListener('error', (event) => note(`page error: ${event.message}`));
+addEventListener('unhandledrejection', (event) => note(`page error: ${why(event.reason)}`));
 
 // The token after '#': its own, or as 'token=' in older links.
 function readLink() {
@@ -342,9 +345,17 @@ function open(relay) {
     session.opened = performance.now();
     note(`connected to ${relay.key}`);
     if (state.sessions.get(relay.key) !== session) return;
-    session.writer = transport.datagrams.writable.getWriter();
-    readDatagrams(session);
-    readStreams(session);
+    try {
+      // Today's WebTransport makes a datagram writer with createWritable(), which is all
+      // Safari has; Chrome also keeps the older writable.
+      const datagrams = transport.datagrams;
+      session.writer = (datagrams.createWritable ? datagrams.createWritable() : datagrams.writable).getWriter();
+      readDatagrams(session);
+      readStreams(session);
+    } catch (error) {
+      note(`could not use the session at ${relay.key}: ${why(error)}`);
+      return;
+    }
     tell('joined', session);
   }, (error) => {
     note(`could not connect to ${relay.key}: ${why(error)}`);
