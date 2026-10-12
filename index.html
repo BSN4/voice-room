@@ -85,6 +85,8 @@
 </div>
 
 <script type="module">
+import { Sessions, why } from './sessions.js';
+
 // ---------------------------------------------------------------------------------------------
 // The link is the page's address, then '#', then the room's invite (ADR 0016): one link for
 // everyone in the call. The browser never sends what follows '#' to any server. A person's own
@@ -175,12 +177,12 @@ const state = {
   token: null, invite: null, person: null, me: null, room: null, tone: false, relays: [], tried: 0,
   context: null, encoder: null, source: null, stream: null, playout: null,
   muted: false, seq: 0, epoch: 0n, t0: 0, ticking: null, since: 0,
-  sessions: new Map(),   // "ip:port" -> { key, ip, port, transport, writer }
   current: null,         // the session the client is joined at, by key
   listed: [],            // the last relay list, for the details
   decoders: new Map(),   // seat -> { decoder, count }
   levels: new Map(),     // seat -> { db, at }
   roomState: null,
+  seat: null,            // this page's own seat, from room state
   stats: { sent: 0, received: 0, played: 0, lost: 0, late: 0, moves: 0 },
 };
 
@@ -212,7 +214,6 @@ $('details').addEventListener('toggle', () => {
   $('log').textContent = $('details').open ? lines.join('\n') : '';
   $('stats').textContent = '';
 });
-const why = (error) => (error && (error.message || error.name)) || String(error);
 // Nothing fails unseen: any error the page did not catch goes into the log too.
 addEventListener('error', (event) => note(`page error: ${event.message}`));
 addEventListener('unhandledrejection', (event) => note(`page error: ${why(event.reason)}`));
@@ -292,7 +293,7 @@ async function loadRelays() {
 const JOIN = 1, LEAVE = 2, PING = 3;
 const RELAY_BYTES = 38;          // address 4, port 2, certificate hash 32
 // voice-web's jitter buffer: what a push and a turn say (crates/voice-web/src/lib.rs).
-const LATE = 2;
+const LATE = 2, MINE = 4;
 const FRAME_OUT = 1, LOST = 2, LOST_WITH_NEXT = 3;
 const OPUS_MAX = 1275;
 let wasm = null;
@@ -347,7 +348,7 @@ function act() {
 // Starts the client at the next relay from relays.json: the first, then the others in turn
 // while none lets us in. Once in, the relays' own list takes over.
 function startClient() {
-  for (const key of [...state.sessions.keys()]) close(key);
+  for (const key of sessions.keys()) close(key);
   const relay = state.relays[state.tried % state.relays.length];
   note(`starting from ${relay.key}`);
   const first = shared(RELAY_BYTES);
@@ -376,69 +377,41 @@ function tick() {
   startClient();
 }
 
-// Opens a session at `relay`: the join. The client hears back when it opens, fails or ends.
-function open(relay) {
-  if (state.sessions.has(relay.key)) return;
-  const who = state.invite ? `invite=${state.invite}&user=${state.person}` : `token=${state.token}`;
-  const url = `https://${relay.key}/?${who}&epoch=${state.epoch}`;
-  let transport;
-  note(`connecting to ${relay.key}`);
-  try {
-    transport = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: relay.hash }] });
-  } catch (error) {
-    note(`could not start a connection to ${relay.key}: ${why(error)}`);
-    return tell('failed', relay);
-  }
-  const session = { ...relay, transport, writer: null, opened: 0, started: performance.now() };
-  state.sessions.set(relay.key, session);
-  transport.ready.then(() => {
-    session.opened = performance.now();
-    note(`connected to ${relay.key}`);
-    if (state.sessions.get(relay.key) !== session) return;
+// The sessions (sessions.js): opened and left as the client says, and what happens to each
+// told back to it.
+const sessions = new Sessions({
+  connect: (url, hash) => new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: hash }] }),
+  now: () => performance.now(),
+  note,
+  ready: (session) => {
     try {
       // Today's WebTransport makes a datagram writer with createWritable(), which is all
       // Safari has; Chrome also keeps the older writable.
-      const datagrams = transport.datagrams;
+      const datagrams = session.transport.datagrams;
       session.writer = (datagrams.createWritable ? datagrams.createWritable() : datagrams.writable).getWriter();
       readDatagrams(session);
       readStreams(session);
     } catch (error) {
-      note(`could not use the session at ${relay.key}: ${why(error)}`);
+      note(`could not use the session at ${session.key}: ${why(error)}`);
       return;
     }
     tell('joined', session);
-  }, (error) => {
-    note(`could not connect to ${relay.key}: ${why(error)}`);
-    if (state.sessions.get(relay.key) !== session) return;
-    state.sessions.delete(relay.key);
-    tell('failed', session);
-  });
-  transport.closed.then(
-    (info) => note(`session at ${relay.key} closed${lasted(session)}: code ${info.closeCode}${info.reason ? `, ${info.reason}` : ''}`),
-    (error) => note(session.opened
-      ? `session at ${relay.key} broke${lasted(session)}: ${why(error)}`
-      : `session at ${relay.key} never became ready: ${why(error)}`),
-  ).finally(() => {
-    if (state.sessions.get(relay.key) !== session) return;
-    state.sessions.delete(relay.key);
-    tell('closed', session);
-  });
+  },
+  failed: (session) => tell('failed', session),
+  closed: (session) => tell('closed', session),
+});
+
+// Opens a session at `relay`: the join. The client hears back when it opens, fails or ends.
+function open(relay) {
+  const who = state.invite ? `invite=${state.invite}&user=${state.person}` : `token=${state.token}`;
+  sessions.open(relay, `https://${relay.key}/?${who}&epoch=${state.epoch}`);
 }
 
-const lasted = (session) => session.opened ? ` after ${((performance.now() - session.opened) / 1000).toFixed(1)} s` : '';
-
-function close(key) {
-  const session = state.sessions.get(key);
-  if (!session) return;
-  const waited = ((performance.now() - session.started) / 1000).toFixed(1);
-  note(session.opened ? `closing ${key}` : `giving up on ${key}: not ready after ${waited} s`);
-  state.sessions.delete(key);
-  try { session.transport.close({ closeCode: 0, reason: 'moved' }); } catch (_) { /* never opened */ }
-}
+const close = (key) => sessions.close(key);
 
 // A ping: a datagram shorter than an audio header, which the relay sends straight back.
 function ping(key) {
-  const session = state.sessions.get(key);
+  const session = sessions.get(key);
   if (session && session.writer) session.writer.write(new Uint8Array([0])).catch(() => {});
 }
 
@@ -482,7 +455,9 @@ async function startAudio() {
   await context.audioWorklet.addModule(url(PLAYOUT));
   const playout = new AudioWorkletNode(context, 'playout', { outputChannelCount: [1] });
   playout.connect(context.destination);
-  playout.port.onmessage = () => turn();
+  // Every 20 ms on the audio clock: each person's turn, and the client's tick. A background
+  // tab's timers run as seldom as once a second; the audio thread's messages keep coming.
+  playout.port.onmessage = () => { turn(); if (state.ticking) tick(); };
   state.playout = playout;
 
   let source;
@@ -541,7 +516,7 @@ function levelOf(pcm) {
 // A frame goes to the relay the client is joined at; while it moves, still to the old one.
 function send(chunk) {
   const db = state.pendingLevels.shift() ?? 127;
-  const session = state.current && state.sessions.get(state.current);
+  const session = state.current && sessions.get(state.current);
   if (!session || !session.writer) return;
   const datagram = new Uint8Array(HEADER + chunk.byteLength);
   const view = new DataView(datagram.buffer);
@@ -581,13 +556,16 @@ function receive(datagram) {
   const seat = view.getUint8(0);
   const seq = view.getUint16(1);
   const db = view.getUint8(7);
-  state.stats.received++;
-  state.levels.set(seat, { db, at: performance.now() });
-  if (!state.decoders.has(seat)) state.decoders.set(seat, newSpeaker(seat));
   const opus = datagram.subarray(HEADER);
   if (opus.byteLength > OPUS_MAX) return;
   shared(opus.byteLength).set(opus);
-  if (wasm.jitter_push(seat, seq, opus.byteLength, clock()) === LATE) state.stats.late++;
+  const pushed = wasm.jitter_push(seat, seq, opus.byteLength, clock());
+  // This page's own audio, come back on another of its sessions while it moves: never played.
+  if (pushed === MINE) return;
+  if (pushed === LATE) state.stats.late++;
+  state.stats.received++;
+  state.levels.set(seat, { db, at: performance.now() });
+  if (!state.decoders.has(seat)) state.decoders.set(seat, newSpeaker(seat));
 }
 
 // Each 20 ms of audio, each person's turn: a frame to decode, or one lost, played silent for
@@ -717,6 +695,13 @@ function roomState(body) {
     note(user === state.me ? 'you are out of the room' : `${personOn(seat)} left`);
   }
   state.roomState = { listeners, seats };
+  // The WebAssembly never plays this page's own seat (ADR 0017); none is past 255.
+  const mine = seats.find(({ user }) => user === state.me);
+  const seat = mine ? mine.seat : 256;
+  if (seat !== state.seat) {
+    state.seat = seat;
+    wasm.own_seat(seat);
+  }
   drawPeople();
 }
 
@@ -777,13 +762,13 @@ function leave() {
   clearInterval(state.ticking);
   state.ticking = null;
   wasm.jitter_clear();
-  for (const key of [...state.sessions.keys()]) close(key);
+  for (const key of sessions.keys()) close(key);
   for (const speaker of state.decoders.values()) if (speaker.decoder.state !== 'closed') speaker.decoder.close();
   state.decoders.clear();
   stopAudio();
   // The frame numbers go on counting: a listener's jitter buffer would take a speaker who starts
   // again from 0 for frames long played, until it saw them start over.
-  Object.assign(state, { current: null, roomState: null });
+  Object.assign(state, { current: null, roomState: null, seat: null });
   $('join').hidden = false;
   $('join').disabled = false;
   $('mute').hidden = true;
