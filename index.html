@@ -336,7 +336,7 @@ function open(relay) {
     note(`could not start a connection to ${relay.key}: ${why(error)}`);
     return tell('failed', relay);
   }
-  const session = { ...relay, transport, writer: null, opened: 0 };
+  const session = { ...relay, transport, writer: null, opened: 0, started: performance.now() };
   state.sessions.set(relay.key, session);
   transport.ready.then(() => {
     session.opened = performance.now();
@@ -354,7 +354,9 @@ function open(relay) {
   });
   transport.closed.then(
     (info) => note(`session at ${relay.key} closed${lasted(session)}: code ${info.closeCode}${info.reason ? `, ${info.reason}` : ''}`),
-    (error) => { if (session.opened) note(`session at ${relay.key} broke${lasted(session)}: ${why(error)}`); },
+    (error) => note(session.opened
+      ? `session at ${relay.key} broke${lasted(session)}: ${why(error)}`
+      : `session at ${relay.key} never became ready: ${why(error)}`),
   ).finally(() => {
     if (state.sessions.get(relay.key) !== session) return;
     state.sessions.delete(relay.key);
@@ -367,6 +369,8 @@ const lasted = (session) => session.opened ? ` after ${((performance.now() - ses
 function close(key) {
   const session = state.sessions.get(key);
   if (!session) return;
+  const waited = ((performance.now() - session.started) / 1000).toFixed(1);
+  note(session.opened ? `closing ${key}` : `giving up on ${key}: not ready after ${waited} s`);
   state.sessions.delete(key);
   try { session.transport.close({ closeCode: 0, reason: 'moved' }); } catch (_) { /* never opened */ }
 }
