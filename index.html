@@ -5,97 +5,90 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Voice room</title>
 <style>
+  /* One column, one job: get into the call and see who is talking. */
   :root {
-    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
-    --accent: #2f6fde; --speaking: #27a35a; --warn: #c2410c;
+    --bg: #f4f5f7; --panel: #ffffff; --ink: #16181d; --muted: #5d636f; --line: #dde1e7;
+    --accent: #2459d6; --accent-ink: #ffffff; --talk: #1f9d55; --bad: #b42318; --bad-bg: #fdecea;
+    --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #151514; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9a9993; --line: #33332f;
-      --accent: #6b9cff; --speaking: #3ccf7a; --warn: #fb923c;
+      --bg: #101216; --panel: #191c22; --ink: #e9ebef; --muted: #9aa1ad; --line: #2a2f38;
+      --accent: #6d95ff; --accent-ink: #0b1020; --talk: #3fd07f; --bad: #ff8a7a; --bad-bg: #3a1714;
+      color-scheme: dark;
     }
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-  }
-  main { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
-  section {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-    padding: 16px; margin-bottom: 16px;
-  }
-  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
-  input {
-    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
-    background: var(--bg); color: var(--ink); font: 13px ui-monospace, monospace;
-  }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 var(--font); }
+  main { max-width: 560px; margin: 0 auto; padding-block: 32px 48px; padding-inline: 16px; display: grid; gap: 16px; }
+  h1 { font-size: 24px; margin: 0; text-wrap: balance; }
+  .room { color: var(--muted); margin: 2px 0 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; display: grid; gap: 14px; }
+  #status { margin: 0; font-size: 15px; }
+  #status.bad { color: var(--bad); background: var(--bad-bg); padding: 10px 12px; border-radius: 10px; }
+  .buttons { display: flex; gap: 10px; flex-wrap: wrap; }
   button {
-    padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
-    background: var(--bg); color: var(--ink); font: inherit; cursor: pointer;
+    padding: 11px 18px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel);
+    color: var(--ink); font: 600 15px var(--font); cursor: pointer;
   }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:disabled { opacity: .5; cursor: default; }
-  #status { font-size: 14px; color: var(--muted); }
-  #status.bad { color: var(--warn); }
-  .seats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
-  .seat {
-    border: 2px solid var(--line); border-radius: 12px; padding: 12px 8px; text-align: center;
-    transition: border-color .12s, box-shadow .12s;
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); padding-inline: 26px; }
+  button:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 2px; }
+  .mic { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--muted); }
+  .meter { flex: 1; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0; background: var(--talk); transition: width 80ms linear; }
+  .people { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+  .person {
+    border: 2px solid var(--line); border-radius: 12px; padding: 14px 10px; text-align: center;
+    transition: border-color 120ms, box-shadow 120ms;
   }
-  .seat.speaking { border-color: var(--speaking); box-shadow: 0 0 0 3px color-mix(in srgb, var(--speaking) 25%, transparent); }
-  .seat .who { font-weight: 600; }
-  .seat .n { font-size: 12px; color: var(--muted); }
-  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; flex: 1; min-width: 120px; }
-  .meter > div { height: 100%; width: 0; background: var(--speaking); transition: width .08s; }
-  .stats { font: 12px ui-monospace, monospace; color: var(--muted); white-space: pre-wrap; margin: 0; }
+  .person.talking { border-color: var(--talk); box-shadow: 0 0 0 4px color-mix(in srgb, var(--talk) 22%, transparent); }
+  .person .name { font-weight: 600; }
+  .person .what { font-size: 13px; color: var(--muted); }
+  .hint { font-size: 14px; color: var(--muted); margin: 0; }
   details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  pre { font: 12px/1.5 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; }
+  @media (prefers-reduced-motion: reduce) { .meter > div, .person { transition: none; } }
 </style>
 </head>
 <body>
 <main>
-  <h1>Voice room</h1>
-  <p class="sub">Talk through the relays: WebTransport datagrams, Opus from your browser, and our Rust client in WebAssembly choosing the relay.</p>
+  <header>
+    <h1>Voice room</h1>
+    <p id="room" class="room">Open your invite link to join.</p>
+  </header>
 
-  <section id="setup">
-    <label for="relay">Relay (host:port)</label>
-    <input id="relay" placeholder="203.0.113.7:4433" autocomplete="off">
-    <label for="hash">Certificate hash (sha-256, hex)</label>
-    <input id="hash" placeholder="64 hex digits the relay printed" autocomplete="off">
-    <label for="token">Token</label>
-    <input id="token" placeholder="198 hex digits from voice-token issue" autocomplete="off">
-    <div class="row">
-      <button id="join" class="primary">Join</button>
-      <button id="leave" disabled>Leave</button>
-      <button id="mute" disabled>Mute</button>
-      <label style="margin:0;display:flex;gap:6px;align-items:center">
-        <input id="tone" type="checkbox" style="width:auto"> test tone instead of the microphone
-      </label>
+  <section class="card">
+    <p id="status">Loading…</p>
+    <div class="buttons">
+      <button id="join" class="primary" disabled>Join the call</button>
+      <button id="mute" hidden>Mute</button>
+      <button id="leave" hidden>Leave</button>
     </div>
-    <div class="row">
-      <span id="status">Not connected.</span>
-    </div>
-    <div class="row"><span style="font-size:13px;color:var(--muted)">You</span><div class="meter"><div id="me"></div></div></div>
+    <div id="mic" class="mic" hidden>Your microphone<div class="meter"><div id="me"></div></div></div>
   </section>
 
-  <section>
-    <div id="room" class="sub" style="margin:0 0 10px">No room yet.</div>
-    <div id="seats" class="seats"></div>
+  <section class="card" id="peoplecard" hidden>
+    <div id="people" class="people"></div>
+    <p id="alone" class="hint" hidden>Nobody else is here yet. Send the other person their link.</p>
   </section>
 
-  <section>
-    <details>
-      <summary>Numbers</summary>
-      <pre id="stats" class="stats"></pre>
-    </details>
-  </section>
+  <details id="details">
+    <summary>Details and log</summary>
+    <pre id="stats"></pre>
+    <div class="buttons" style="margin-top:10px"><button id="copy">Copy log</button><span id="copied" class="hint" hidden>Copied</span></div>
+    <pre id="log"></pre>
+  </details>
 </main>
 
 <script type="module">
 // ---------------------------------------------------------------------------------------------
+// The link is the page's address, then '#', then the person's token: the browser never sends
+// what follows '#' to any server. Which relays to use comes from relays.json beside the page,
+// which lab/aws.sh call writes. Add '&tone' after the token to send a 440 Hz tone instead of
+// the microphone, for testing.
+//
 // The wire (ADR 0003): each 20 ms Opus frame is one datagram behind a 9-byte header.
 //   0 seat (the relay writes it) | 1-2 seq | 3-6 ts, 48 kHz | 7 level, dB below full scale |
 //   8 flags: bit 0 silence, bit 1 error correction, bits 4-7 codec (0 Opus)
@@ -107,6 +100,8 @@ const RATE = 48000;
 const FRAME = 960;               // 20 ms at 48 kHz
 const HEADER = 9;
 const SILENT_DB = 60;            // a frame quieter than -60 dBFS is silence
+const TALKING_DB = 45;           // louder than -45 dBFS lights a person up
+const GIVE_UP_MS = 6000;         // a relay that has not let us in by then: try the next
 const $ = (id) => document.getElementById(id);
 
 // Capture: 128-sample blocks from the microphone, gathered into 20 ms frames.
@@ -129,19 +124,21 @@ class Capture extends AudioWorkletProcessor {
 }
 registerProcessor('capture', Capture);`;
 
-// Playout: each seat's decoded audio, mixed. The jitter is taken out before decoding (see
-// receive); this only smooths the page's own timers: each seat waits until 40 ms is queued
-// before it plays, starts over after running dry, and drops its oldest audio past 200 ms.
+// Playout: each person's decoded audio, mixed. It also beats the page's 20 ms turns ('turn'),
+// on the audio clock: a page in a background tab has its timers slowed, its audio never.
+// Each person waits until 40 ms is queued before they play, starts over after running dry,
+// and drops their oldest audio past 200 ms.
 const PLAYOUT = `
 const TARGET = ${FRAME * 2}, MOST = ${FRAME * 10};
 class Playout extends AudioWorkletProcessor {
   constructor() {
     super();
     this.seats = new Map();
+    this.beat = 0;
     this.port.onmessage = (e) => {
       const { seat, pcm } = e.data;
       let s = this.seats.get(seat);
-      if (!s) { s = { chunks: [], at: 0, queued: 0, playing: false, under: 0 }; this.seats.set(seat, s); }
+      if (!s) { s = { chunks: [], at: 0, queued: 0, playing: false }; this.seats.set(seat, s); }
       s.chunks.push(pcm); s.queued += pcm.length;
       while (s.queued - s.at > MOST && s.chunks.length > 1) { s.queued -= s.chunks[0].length; s.chunks.shift(); s.at = 0; }
     };
@@ -154,28 +151,30 @@ class Playout extends AudioWorkletProcessor {
       if (!s.playing) { if (have >= TARGET) s.playing = true; else continue; }
       for (let i = 0; i < out.length; i++) {
         const chunk = s.chunks[0];
-        if (!chunk) { s.playing = false; s.under++; break; }
+        if (!chunk) { s.playing = false; break; }
         out[i] += chunk[s.at++];
         if (s.at === chunk.length) { s.chunks.shift(); s.queued -= chunk.length; s.at = 0; }
       }
     }
     for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, out[i]));
+    this.beat += out.length;
+    if (this.beat >= ${FRAME}) { this.beat -= ${FRAME}; this.port.postMessage('turn'); }
     return true;
   }
 }
 registerProcessor('playout', Playout);`;
 
 const state = {
-  context: null, encoder: null, source: null, stream: null,
-  muted: false, seq: 0, me: null, token: null, epoch: 0n, t0: 0, ticking: null,
-  playing: null, turn: 0,  // the playout timer, and the next 20 ms turn on the page's clock
+  token: null, me: null, room: null, tone: false, relays: [], tried: 0,
+  context: null, encoder: null, source: null, stream: null, playout: null,
+  muted: false, seq: 0, epoch: 0n, t0: 0, ticking: null, since: 0,
   sessions: new Map(),   // "ip:port" -> { key, ip, port, transport, writer }
   current: null,         // the session the client is joined at, by key
-  relays: [],            // the last relay list, for the numbers
+  listed: [],            // the last relay list, for the details
   decoders: new Map(),   // seat -> { decoder, count }
   levels: new Map(),     // seat -> { db, at }
-  stats: { sent: 0, received: 0, played: 0, lost: 0, late: 0, bytesOut: 0, bytesIn: 0, moves: 0 },
-  room: null,
+  roomState: null,
+  stats: { sent: 0, received: 0, played: 0, lost: 0, late: 0, moves: 0 },
 };
 
 function hexBytes(hex) {
@@ -184,24 +183,53 @@ function hexBytes(hex) {
   return Uint8Array.from(clean.match(/../g), (pair) => parseInt(pair, 16));
 }
 
-function setStatus(text, bad = false) {
+function say(text, bad = false) {
+  if ($('status').textContent !== text) note(text);
   $('status').textContent = text;
   $('status').className = bad ? 'bad' : '';
 }
 
-// The link carries the settings after '#', which the browser never sends to the web server.
-function readFragment() {
-  const params = new URLSearchParams(location.hash.slice(1));
-  for (const key of ['relay', 'hash', 'token']) if (params.get(key)) $(key).value = params.get(key);
+// The page's log: what happened, when, with the browser's own words for errors. Under
+// "Details and log", to copy and send; the console has it too.
+const lines = [];
+function note(text) {
+  const line = `${new Date().toISOString().slice(11, 23)} ${text}`;
+  lines.push(line);
+  if (lines.length > 400) lines.shift();
+  console.info(`[voice] ${line}`);
+  $('log').textContent = lines.join('\n');
+}
+const why = (error) => (error && (error.message || error.name)) || String(error);
+
+// The token after '#': its own, or as 'token=' in older links.
+function readLink() {
+  const fragment = location.hash.slice(1);
+  const params = new URLSearchParams(fragment);
+  const token = params.get('token') ?? fragment.split('&')[0];
+  state.tone = params.has('tone');
+  const fields = hexBytes(token || '');
+  if (!fields || fields.length !== 99) return false;
+  // The token's fields: format 1, user 8, room 8, ... (crates/voice-token).
+  const view = new DataView(fields.buffer);
+  state.token = token.trim();
+  state.me = Number(view.getBigUint64(1));
+  state.room = view.getBigUint64(9);
+  return true;
 }
 
 function missingFeatures() {
-  const missing = [];
-  if (!('WebTransport' in window)) missing.push('WebTransport');
-  if (!('AudioEncoder' in window)) missing.push('WebCodecs AudioEncoder');
-  if (!('AudioDecoder' in window)) missing.push('WebCodecs AudioDecoder');
-  if (!window.AudioWorkletNode) missing.push('AudioWorklet');
-  return missing;
+  return ['WebTransport', 'AudioEncoder', 'AudioDecoder', 'AudioWorkletNode'].filter((name) => !(name in window));
+}
+
+async function loadRelays() {
+  const response = await fetch(`relays.json?at=${Date.now()}`, { cache: 'no-store' });
+  if (!response.ok) throw new Error('no relays.json');
+  const { relays } = await response.json();
+  state.relays = relays.map(({ at, hash }) => {
+    const [ip, port] = at.split(':');
+    return { ip, port: Number(port), key: at, hash: hexBytes(hash) };
+  }).filter((relay) => relay.hash && relay.hash.length === 32);
+  if (!state.relays.length) throw new Error('relays.json lists no relay');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -246,16 +274,54 @@ function tell(call, session) {
 function act() {
   for (let kind = wasm.poll(); kind !== 0; kind = wasm.poll()) {
     const relay = relayInBuffer(kind === JOIN);
-    if (kind === JOIN) open(relay);
-    else if (kind === LEAVE) close(relay.key);
+    if (kind === JOIN) { note(`client: join ${relay.key}`); open(relay); }
+    else if (kind === LEAVE) { note(`client: leave ${relay.key}`); close(relay.key); }
     else if (kind === PING) ping(relay.key);
   }
   const joined = wasm.relay() === 1 ? relayInBuffer(false).key : null;
   if (joined !== state.current) {
     if (state.current && joined) state.stats.moves++;
     state.current = joined;
-    setStatus(joined ? `In the room, through ${joined}.` : 'Finding a relay…', !joined);
+    if (joined) {
+      state.tried = 0;
+      say('You are in the call. Talk away.');
+    } else {
+      state.since = performance.now();
+      say('Reconnecting…');
+    }
   }
+}
+
+// Starts the client at the next relay from relays.json: the first, then the others in turn
+// while none lets us in. Once in, the relays' own list takes over.
+function startClient() {
+  for (const key of [...state.sessions.keys()]) close(key);
+  const relay = state.relays[state.tried % state.relays.length];
+  note(`starting from ${relay.key}`);
+  const first = shared(RELAY_BYTES);
+  const view = new DataView(first.buffer, first.byteOffset);
+  view.setUint32(0, ipNumber(relay.ip));
+  view.setUint16(4, relay.port);
+  first.set(relay.hash, 6);
+  const seed = new BigUint64Array(1);
+  crypto.getRandomValues(seed);
+  wasm.start(state.room, 0, seed[0], clock(), 1);
+  state.since = performance.now();
+  act();
+}
+
+// Every 10 ms: the client's clock, and the watch on getting in.
+function tick() {
+  wasm.tick(clock());
+  act();
+  if (state.current || performance.now() - state.since < GIVE_UP_MS) return;
+  state.tried++;
+  if (state.tried >= state.relays.length) {
+    say('Can’t reach the voice servers. Your network may block calls: try another network, such as your phone’s hotspot. Still trying…', true);
+  } else {
+    say('Trying another voice server…');
+  }
+  startClient();
 }
 
 // Opens a session at `relay`: the join. The client hears back when it opens, fails or ends.
@@ -263,30 +329,40 @@ function open(relay) {
   if (state.sessions.has(relay.key)) return;
   const url = `https://${relay.key}/?token=${state.token}&epoch=${state.epoch}`;
   let transport;
+  note(`connecting to ${relay.key}`);
   try {
     transport = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: relay.hash }] });
-  } catch (_) {
+  } catch (error) {
+    note(`could not start a connection to ${relay.key}: ${why(error)}`);
     return tell('failed', relay);
   }
-  const session = { ...relay, transport, writer: null };
+  const session = { ...relay, transport, writer: null, opened: 0 };
   state.sessions.set(relay.key, session);
   transport.ready.then(() => {
+    session.opened = performance.now();
+    note(`connected to ${relay.key}`);
     if (state.sessions.get(relay.key) !== session) return;
     session.writer = transport.datagrams.writable.getWriter();
     readDatagrams(session);
     readStreams(session);
     tell('joined', session);
-  }, () => {
+  }, (error) => {
+    note(`could not connect to ${relay.key}: ${why(error)}`);
     if (state.sessions.get(relay.key) !== session) return;
     state.sessions.delete(relay.key);
     tell('failed', session);
   });
-  transport.closed.catch(() => {}).finally(() => {
+  transport.closed.then(
+    (info) => note(`session at ${relay.key} closed${lasted(session)}: code ${info.closeCode}${info.reason ? `, ${info.reason}` : ''}`),
+    (error) => { if (session.opened) note(`session at ${relay.key} broke${lasted(session)}: ${why(error)}`); },
+  ).finally(() => {
     if (state.sessions.get(relay.key) !== session) return;
     state.sessions.delete(relay.key);
     tell('closed', session);
   });
 }
+
+const lasted = (session) => session.opened ? ` after ${((performance.now() - session.opened) / 1000).toFixed(1)} s` : '';
 
 function close(key) {
   const session = state.sessions.get(key);
@@ -302,61 +378,50 @@ function ping(key) {
 }
 
 async function join() {
-  const missing = missingFeatures();
-  if (missing.length) return setStatus(`This browser lacks ${missing.join(', ')}.`, true);
-  const relay = $('relay').value.trim();
-  const hash = hexBytes($('hash').value);
-  const token = $('token').value.trim();
-  const fields = hexBytes(token);
-  const [ip, port] = relay.split(':');
-  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip || '') || !Number(port) || !hash || hash.length !== 32 || !fields || fields.length !== 99) {
-    return setStatus('Fill in the relay as address:port, a 64-digit hash and the token.', true);
-  }
-  location.hash = new URLSearchParams({ relay, hash: $('hash').value.trim(), token }).toString();
-  // The token's fields: format 1, user 8, room 8, ... (crates/voice-token).
-  const view = new DataView(fields.buffer);
-  state.me = Number(view.getBigUint64(1));
-  state.token = token;
   $('join').disabled = true;
-  setStatus('Starting audio…');
+  say(state.tone ? 'Starting the test tone…' : 'Asking for your microphone…');
   try {
-    if (!wasm) await loadClient();
     await startAudio();
   } catch (error) {
+    note(`audio did not start: ${why(error)}`);
+    stopAudio();
     $('join').disabled = false;
-    return setStatus(`Could not start: ${error.message || error}`, true);
+    return say(micTrouble(error), true);
   }
-  // The relay to join first goes in the buffer, then the client starts.
-  const first = shared(RELAY_BYTES);
-  new DataView(first.buffer, first.byteOffset).setUint32(0, ipNumber(ip));
-  new DataView(first.buffer, first.byteOffset).setUint16(4, Number(port));
-  first.set(hash, 6);
-  const seed = new BigUint64Array(1);
-  crypto.getRandomValues(seed);
+  note(state.tone ? 'sending a 440 Hz test tone' : `microphone on: ${state.stream.getAudioTracks()[0]?.label || 'unnamed'}`);
+  $('mic').hidden = false;
+  $('join').hidden = true;
+  $('mute').hidden = false;
+  $('leave').hidden = false;
+  $('peoplecard').hidden = false;
+  say('Connecting…');
   state.t0 = performance.now();
-  wasm.start(view.getBigUint64(9), 0, seed[0], 0, 1);
-  state.ticking = setInterval(() => { wasm.tick(clock()); act(); }, 10);
-  state.turn = 0;
-  state.playing = setInterval(playout, 5);
-  wasm.tick(0);
-  act();
-  $('leave').disabled = false;
-  $('mute').disabled = false;
+  state.tried = 0;
+  state.ticking = setInterval(tick, 10);
+  startClient();
+}
+
+function micTrouble(error) {
+  const name = error && error.name;
+  if (name === 'NotAllowedError') return 'Your browser blocked the microphone. Click the icon left of the address, allow the microphone, then press Join again.';
+  if (name === 'NotFoundError') return 'No microphone found. Connect one, then press Join again.';
+  if (name === 'NotReadableError') return 'Another app is using the microphone. Close it, then press Join again.';
+  return `Could not start audio: ${(error && error.message) || error}`;
 }
 
 async function startAudio() {
   const context = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
   state.context = context;
-  if (context.sampleRate !== RATE) throw new Error(`audio runs at ${context.sampleRate} Hz, not 48000`);
   const url = (code) => URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   await context.audioWorklet.addModule(url(CAPTURE));
   await context.audioWorklet.addModule(url(PLAYOUT));
   const playout = new AudioWorkletNode(context, 'playout', { outputChannelCount: [1] });
   playout.connect(context.destination);
+  playout.port.onmessage = () => turn();
   state.playout = playout;
 
   let source;
-  if ($('tone').checked) {
+  if (state.tone) {
     const tone = context.createOscillator();
     tone.frequency.value = 440;
     const gain = context.createGain();
@@ -371,13 +436,14 @@ async function startAudio() {
     state.stream = stream;
     source = context.createMediaStreamSource(stream);
   }
+  if (context.state !== 'running') await context.resume();
   const capture = new AudioWorkletNode(context, 'capture', { numberOfInputs: 1, numberOfOutputs: 0 });
   source.connect(capture);
   state.source = source;
 
   const encoder = new AudioEncoder({
     output: (chunk) => send(chunk),
-    error: (error) => setStatus(`Encoder: ${error.message}`, true),
+    error: (error) => say(`Your browser’s audio encoder failed: ${error.message}`, true),
   });
   encoder.configure({
     codec: 'opus', sampleRate: RATE, numberOfChannels: 1, bitrate: 32000,
@@ -388,7 +454,7 @@ async function startAudio() {
   capture.port.onmessage = (e) => {
     const pcm = e.data;
     const db = levelOf(pcm);
-    $('me').style.width = `${Math.max(0, 100 - db * 100 / SILENT_DB)}%`;
+    $('me').style.width = state.muted ? '0%' : `${Math.max(0, 100 - db * 100 / SILENT_DB)}%`;
     if (state.muted || encoder.state !== 'configured') return;
     state.pendingLevels.push(db);
     encoder.encode(new AudioData({
@@ -423,7 +489,6 @@ function send(chunk) {
   chunk.copyTo(datagram.subarray(HEADER));
   state.seq = (state.seq + 1) >>> 0;
   state.stats.sent++;
-  state.stats.bytesOut += datagram.byteLength;
   session.writer.write(datagram).catch(() => {});
   wasm.sent(clock());
 }
@@ -452,7 +517,6 @@ function receive(datagram) {
   const seq = view.getUint16(1);
   const db = view.getUint8(7);
   state.stats.received++;
-  state.stats.bytesIn += datagram.byteLength;
   state.levels.set(seat, { db, at: performance.now() });
   if (!state.decoders.has(seat)) state.decoders.set(seat, newSpeaker(seat));
   const opus = datagram.subarray(HEADER);
@@ -461,25 +525,21 @@ function receive(datagram) {
   if (wasm.jitter_push(seat, seq, opus.byteLength, clock()) === LATE) state.stats.late++;
 }
 
-// Every 20 ms on the page's clock, each seat's turn: a frame to decode, or one lost, played
-// silent for now (rebuilding it from the next frame's FEC needs our own Opus decoder), or
-// nothing yet. A tab put to sleep starts again from now.
-function playout() {
+// Each 20 ms of audio, each person's turn: a frame to decode, or one lost, played silent for
+// now (rebuilding it from the next frame's FEC needs our own Opus decoder), or nothing yet.
+function turn() {
+  if (!state.ticking) return;
   const now = clock();
-  if (now - state.turn > 200) state.turn = now;
-  while (state.turn <= now) {
-    for (const [seat, speaker] of state.decoders) {
-      const said = wasm.jitter_pop(seat, state.turn);
-      const kind = said & 3;
-      if (kind === FRAME_OUT) {
-        state.stats.played++;
-        decode(speaker, shared(said >>> 2).slice());
-      } else if (kind === LOST || kind === LOST_WITH_NEXT) {
-        state.stats.lost++;
-        state.playout.port.postMessage({ seat, pcm: new Float32Array(FRAME) });
-      }
+  for (const [seat, speaker] of state.decoders) {
+    const said = wasm.jitter_pop(seat, now);
+    const kind = said & 3;
+    if (kind === FRAME_OUT) {
+      state.stats.played++;
+      decode(speaker, shared(said >>> 2).slice());
+    } else if (kind === LOST || kind === LOST_WITH_NEXT) {
+      state.stats.lost++;
+      state.playout.port.postMessage({ seat, pcm: new Float32Array(FRAME) });
     }
-    state.turn += 20;
   }
 }
 
@@ -495,9 +555,9 @@ function newSpeaker(seat) {
         for (let i = 0; i < ints.length; i++) pcm[i] = ints[i] / 32768;
       }
       audio.close();
-      state.playout.port.postMessage({ seat, pcm }, [pcm.buffer]);
+      if (state.playout) state.playout.port.postMessage({ seat, pcm }, [pcm.buffer]);
     },
-    error: (error) => setStatus(`Decoder: ${error.message}`, true),
+    error: (error) => say(`Your browser’s audio decoder failed: ${error.message}`, true),
   });
   decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
   return { decoder, count: 0 };
@@ -559,7 +619,7 @@ function controlFrame(session, body) {
   roomState(body);
 }
 
-// The list's epoch goes with every join; its relays, into the numbers.
+// The list's epoch goes with every join; its relays, into the details.
 function noteRelays(body) {
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
   const epoch = view.getBigUint64(1);
@@ -569,75 +629,114 @@ function noteRelays(body) {
   for (let i = 0, at = 10; i < body[9] && at + 47 <= body.length; i++, at += 47) {
     relays.push(`${ipText(view.getUint32(at + 8))}:${view.getUint16(at + 12)}${body[at + 14] ? ' (draining)' : ''}`);
   }
-  state.relays = relays;
+  state.listed = relays;
 }
 
 function roomState(body) {
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
   if (body.length < 15 || view.getUint8(0) !== 1) return;
-  const room = view.getBigUint64(1);
   const listeners = view.getUint32(9);
   const count = view.getUint16(13);
   const seats = [];
   for (let i = 0; i < count && 15 + i * 9 + 9 <= body.length; i++) {
     seats.push({ seat: view.getUint8(15 + i * 9), user: Number(view.getBigUint64(16 + i * 9)) });
   }
-  state.room = { room, listeners, seats };
-  drawRoom();
+  const before = new Set((state.roomState?.seats ?? []).map(({ user }) => user));
+  const after = new Set(seats.map(({ user }) => user));
+  for (const user of after) if (!before.has(user)) note(user === state.me ? 'you are in the room' : `person ${user} came in`);
+  for (const user of before) if (!after.has(user)) note(user === state.me ? 'you are out of the room' : `person ${user} left`);
+  state.roomState = { listeners, seats };
+  drawPeople();
 }
 
-function drawRoom() {
-  const room = state.room;
+function drawPeople() {
+  const room = state.roomState;
   if (!room) return;
-  $('room').textContent = `Room ${room.room} · ${room.seats.length} speaking · ${room.listeners} listening`;
-  $('seats').replaceChildren(...room.seats.map(({ seat, user }) => {
+  $('people').replaceChildren(...room.seats.map(({ seat, user }) => {
     const card = document.createElement('div');
-    card.className = 'seat';
+    card.className = 'person';
     card.dataset.seat = seat;
-    const who = document.createElement('div');
-    who.className = 'who';
-    who.textContent = user === state.me ? `You (${user})` : `User ${user}`;
-    const n = document.createElement('div');
-    n.className = 'n';
-    n.textContent = `seat ${seat}`;
-    card.append(who, n);
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = user === state.me ? 'You' : `Person ${user}`;
+    const what = document.createElement('div');
+    what.className = 'what';
+    what.textContent = 'Quiet';
+    card.append(name, what);
     return card;
   }));
+  const others = room.seats.filter(({ user }) => user !== state.me).length + room.listeners;
+  $('alone').hidden = others > 0;
 }
 
-// Speaking rings, from each datagram's level: the relay never decodes, nor does this.
+// Who is talking, from each frame's level: neither the relay nor this page decodes for it.
 setInterval(() => {
   const now = performance.now();
-  for (const card of document.querySelectorAll('.seat')) {
-    const level = state.levels.get(Number(card.dataset.seat));
-    card.classList.toggle('speaking', !!level && now - level.at < 300 && level.db < 45);
+  for (const card of document.querySelectorAll('.person')) {
+    const seat = Number(card.dataset.seat);
+    const mine = state.roomState?.seats.find((s) => s.seat === seat)?.user === state.me;
+    const level = state.levels.get(seat);
+    const talking = mine
+      ? !state.muted && Number.parseFloat($('me').style.width || '0') > 25
+      : !!level && now - level.at < 300 && level.db < TALKING_DB;
+    card.classList.toggle('talking', talking);
+    card.querySelector('.what').textContent = mine && state.muted ? 'Muted' : talking ? 'Talking' : 'Quiet';
   }
   const s = state.stats;
   $('stats').textContent =
-    `sent ${s.sent} frames, ${(s.bytesOut / 1024).toFixed(1)} KB\n` +
-    `received ${s.received} frames, ${(s.bytesIn / 1024).toFixed(1)} KB\n` +
-    `played ${s.played}, lost ${s.lost}, too late ${s.late}\n` +
     `relay ${state.current ?? 'none'}, moved ${s.moves} times\n` +
-    `relays at epoch ${state.epoch}: ${state.relays.join(', ') || 'no list yet'}`;
+    `sent ${s.sent} frames, received ${s.received}, played ${s.played}, lost ${s.lost}, too late ${s.late}\n` +
+    `relays in the list: ${state.listed.join(', ') || 'none yet'}\n` +
+    `relays to start from: ${state.relays.map((r) => r.key).join(', ') || 'none'}`;
 }, 100);
 
-function leave() {
-  clearInterval(state.ticking);
-  clearInterval(state.playing);
-  wasm.jitter_clear();
-  state.ticking = null;
-  for (const key of [...state.sessions.keys()]) close(key);
-  for (const speaker of state.decoders.values()) if (speaker.decoder.state !== 'closed') speaker.decoder.close();
-  state.decoders.clear();
+function stopAudio() {
   if (state.encoder && state.encoder.state !== 'closed') state.encoder.close();
   if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
   if (state.context) state.context.close();
-  Object.assign(state, { encoder: null, context: null, stream: null, seq: 0, current: null });
-  $('join').disabled = false;
-  $('leave').disabled = true;
-  $('mute').disabled = true;
-  setStatus('Left the room.');
+  Object.assign(state, { encoder: null, context: null, stream: null, playout: null });
 }
+
+function leave() {
+  note('you pressed Leave');
+  clearInterval(state.ticking);
+  state.ticking = null;
+  wasm.jitter_clear();
+  for (const key of [...state.sessions.keys()]) close(key);
+  for (const speaker of state.decoders.values()) if (speaker.decoder.state !== 'closed') speaker.decoder.close();
+  state.decoders.clear();
+  stopAudio();
+  // The frame numbers go on counting: a listener's jitter buffer would take a speaker who starts
+  // again from 0 for frames long played, until it saw them start over.
+  Object.assign(state, { current: null, roomState: null });
+  $('join').hidden = false;
+  $('join').disabled = false;
+  $('mute').hidden = true;
+  $('leave').hidden = true;
+  $('mic').hidden = true;
+  $('peoplecard').hidden = true;
+  say('You left the call.');
+}
+
+$('copy').onclick = () => {
+  const text = lines.join('\n');
+  navigator.clipboard.writeText(text).then(() => {
+    $('copied').hidden = false;
+    setTimeout(() => { $('copied').hidden = true; }, 2000);
+  }, () => {
+    const range = document.createRange();
+    range.selectNodeContents($('log'));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  });
+};
+
+// Every 5 s in a call, the numbers into the log.
+setInterval(() => {
+  if (!state.ticking) return;
+  const s = state.stats;
+  note(`in ${state.current ?? 'no relay'}: sent ${s.sent}, received ${s.received}, played ${s.played}, lost ${s.lost}, late ${s.late}`);
+}, 5000);
 
 $('join').onclick = join;
 $('leave').onclick = leave;
@@ -645,9 +744,25 @@ $('mute').onclick = () => {
   state.muted = !state.muted;
   $('mute').textContent = state.muted ? 'Unmute' : 'Mute';
 };
-readFragment();
-const missing = missingFeatures();
-if (missing.length) setStatus(`This browser lacks ${missing.join(', ')}.`, true);
+
+// Before anything: is this a link, and can this browser make the call?
+async function boot() {
+  const missing = missingFeatures();
+  if (missing.length) return say('This browser can’t make the call. Open the link in Chrome or Edge on a computer.', true);
+  if (!readLink()) return say('This page needs your invite link. Ask whoever set up the call for it.', true);
+  $('room').textContent = `Room ${state.room}`;
+  note(`${navigator.userAgent}`);
+  note(`room ${state.room}, you are person ${state.me}`);
+  try {
+    await Promise.all([loadClient(), loadRelays()]);
+  } catch (_) {
+    return say('The call isn’t set up right now: no voice servers are listed. Ask whoever set it up.', true);
+  }
+  note(`voice servers: ${state.relays.map((r) => r.key).join(', ')}`);
+  say('Ready. Press Join and allow the microphone.');
+  $('join').disabled = false;
+}
+boot();
 </script>
 </body>
 </html>
