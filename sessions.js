@@ -1,7 +1,7 @@
 // The page's sessions, one per relay it is joining or joined at, by "ip:port". The client in
 // the WebAssembly decides which to open and which to leave; this keeps track of each, tells
 // the page when one is ready, fails or ends, and closes them. Tested by sessions.test.js
-// (`node --test web/sessions.test.js`), with a stand-in for the browser's WebTransport.
+// (`node --test web/*.test.js`), with a stand-in for the browser's WebTransport.
 //
 // A session is never closed while it connects. Safari ignores that close and connects anyway,
 // and the relay then holds a session the page has forgotten: in a call, one page left dozens in

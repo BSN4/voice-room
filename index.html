@@ -86,13 +86,15 @@
 
 <script type="module">
 import { Sessions, why } from './sessions.js';
+import { Output, lockScreen, sayItIsACall } from './background.js';
 
 // ---------------------------------------------------------------------------------------------
 // The link is the page's address, then '#', then the room's invite (ADR 0016): one link for
 // everyone in the call. The browser never sends what follows '#' to any server. A person's own
 // token still works in its place, as older links have it. Which relays to use comes from
 // relays.json beside the page, which lab/aws.sh call writes. Add '&tone' after the invite to send
-// a 440 Hz tone instead of the microphone, for testing.
+// a 440 Hz tone instead of the microphone, for testing, and '&webaudio' to leave out what keeps a
+// call going in Safari's background (background.js, ADR 0019), to compare.
 //
 // With an invite, the page keeps a random person id for this tab, so a reload is the same person
 // and gets their seat back, and sends it with the invite. The relay knows the person by a hash of
@@ -174,7 +176,8 @@ class Playout extends AudioWorkletProcessor {
 registerProcessor('playout', Playout);`;
 
 const state = {
-  token: null, invite: null, person: null, me: null, room: null, tone: false, relays: [], tried: 0,
+  token: null, invite: null, person: null, me: null, room: null, tone: false, webaudio: false,
+  relays: [], tried: 0, output: null,
   context: null, encoder: null, source: null, stream: null, playout: null,
   muted: false, seq: 0, epoch: 0n, t0: 0, ticking: null, since: 0,
   current: null,         // the session the client is joined at, by key
@@ -224,6 +227,7 @@ function readLink() {
   const params = new URLSearchParams(fragment);
   const given = (params.get('invite') ?? params.get('token') ?? fragment.split('&')[0] ?? '').trim();
   state.tone = params.has('tone');
+  state.webaudio = params.has('webaudio');
   const fields = hexBytes(given);
   if (!fields) return false;
   const view = new DataView(fields.buffer);
@@ -448,13 +452,20 @@ function micTrouble(error) {
 }
 
 async function startAudio() {
+  // Before any audio, and before anything waits, so it is still the click's: where WebKit lets
+  // it, the page is a call, played through an audio element that iOS keeps playing in the
+  // background (background.js, ADR 0019).
+  const call = !state.webaudio && sayItIsACall(navigator, note);
   const context = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
   state.context = context;
+  context.onstatechange = () => note(`audio: ${context.state}`);
+  state.output = call ? new Output({ context, makeAudio: () => new Audio(), note }) : null;
   const url = (code) => URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   await context.audioWorklet.addModule(url(CAPTURE));
   await context.audioWorklet.addModule(url(PLAYOUT));
   const playout = new AudioWorkletNode(context, 'playout', { outputChannelCount: [1] });
-  playout.connect(context.destination);
+  if (state.output) state.output.play(playout);
+  else playout.connect(context.destination);
   // Every 20 ms on the audio clock: each person's turn, and the client's tick. A background
   // tab's timers run as seldom as once a second; the audio thread's messages keep coming.
   playout.port.onmessage = () => { turn(); if (state.ticking) tick(); };
@@ -474,9 +485,21 @@ async function startAudio() {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
     state.stream = stream;
+    // What the browser does to the microphone, in the background above all, goes in the log.
+    const track = stream.getAudioTracks()[0];
+    if (track) {
+      track.onmute = () => note('the browser stopped the microphone for now');
+      track.onunmute = () => note('the microphone is back');
+      track.onended = () => note('the microphone ended');
+    }
     source = context.createMediaStreamSource(stream);
   }
   if (context.state !== 'running') await context.resume();
+  if (call) {
+    lockScreen(navigator.mediaSession, window.MediaMetadata, {
+      title: `Room ${state.room}`, mute: () => setMuted(true), unmute: () => setMuted(false),
+    });
+  }
   const capture = new AudioWorkletNode(context, 'capture', { numberOfInputs: 1, numberOfOutputs: 0 });
   source.connect(capture);
   state.source = source;
@@ -753,8 +776,9 @@ setInterval(() => {
 function stopAudio() {
   if (state.encoder && state.encoder.state !== 'closed') state.encoder.close();
   if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
+  if (state.output) state.output.stop();
   if (state.context) state.context.close();
-  Object.assign(state, { encoder: null, context: null, stream: null, playout: null });
+  Object.assign(state, { encoder: null, context: null, stream: null, playout: null, output: null });
 }
 
 function leave() {
@@ -800,10 +824,22 @@ setInterval(() => {
 
 $('join').onclick = join;
 $('leave').onclick = leave;
-$('mute').onclick = () => {
-  state.muted = !state.muted;
-  $('mute').textContent = state.muted ? 'Unmute' : 'Mute';
-};
+function setMuted(muted) {
+  state.muted = muted;
+  $('mute').textContent = muted ? 'Unmute' : 'Mute';
+}
+$('mute').onclick = () => setMuted(!state.muted);
+
+// In a call, the page going to the background and coming back goes in the log: what iOS does to
+// a call then is still being learned (ADR 0019). Back in front, audio the browser stopped picks
+// up again.
+document.addEventListener('visibilitychange', () => {
+  if (!state.ticking) return;
+  note(document.hidden ? 'the page is in the background' : 'the page is in front again');
+  if (document.hidden) return;
+  if (state.output) state.output.resume();
+  else if (state.context && state.context.state !== 'running') state.context.resume().catch(() => {});
+});
 
 // Before anything: is this a link, and can this browser make the call?
 async function boot() {
