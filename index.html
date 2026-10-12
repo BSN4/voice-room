@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice room</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
+    --accent: #2f6fde; --speaking: #27a35a; --warn: #c2410c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151514; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9a9993; --line: #33332f;
+      --accent: #6b9cff; --speaking: #3ccf7a; --warn: #fb923c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  input {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font: 13px ui-monospace, monospace;
+  }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+  button {
+    padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 14px; color: var(--muted); }
+  #status.bad { color: var(--warn); }
+  .seats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+  .seat {
+    border: 2px solid var(--line); border-radius: 12px; padding: 12px 8px; text-align: center;
+    transition: border-color .12s, box-shadow .12s;
+  }
+  .seat.speaking { border-color: var(--speaking); box-shadow: 0 0 0 3px color-mix(in srgb, var(--speaking) 25%, transparent); }
+  .seat .who { font-weight: 600; }
+  .seat .n { font-size: 12px; color: var(--muted); }
+  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; flex: 1; min-width: 120px; }
+  .meter > div { height: 100%; width: 0; background: var(--speaking); transition: width .08s; }
+  .stats { font: 12px ui-monospace, monospace; color: var(--muted); white-space: pre-wrap; margin: 0; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voice room</h1>
+  <p class="sub">Talk through the relays: WebTransport datagrams, Opus from your browser, and our Rust client in WebAssembly choosing the relay.</p>
+
+  <section id="setup">
+    <label for="relay">Relay (host:port)</label>
+    <input id="relay" placeholder="203.0.113.7:4433" autocomplete="off">
+    <label for="hash">Certificate hash (sha-256, hex)</label>
+    <input id="hash" placeholder="64 hex digits the relay printed" autocomplete="off">
+    <label for="token">Token</label>
+    <input id="token" placeholder="198 hex digits from voice-token issue" autocomplete="off">
+    <div class="row">
+      <button id="join" class="primary">Join</button>
+      <button id="leave" disabled>Leave</button>
+      <button id="mute" disabled>Mute</button>
+      <label style="margin:0;display:flex;gap:6px;align-items:center">
+        <input id="tone" type="checkbox" style="width:auto"> test tone instead of the microphone
+      </label>
+    </div>
+    <div class="row">
+      <span id="status">Not connected.</span>
+    </div>
+    <div class="row"><span style="font-size:13px;color:var(--muted)">You</span><div class="meter"><div id="me"></div></div></div>
+  </section>
+
+  <section>
+    <div id="room" class="sub" style="margin:0 0 10px">No room yet.</div>
+    <div id="seats" class="seats"></div>
+  </section>
+
+  <section>
+    <details>
+      <summary>Numbers</summary>
+      <pre id="stats" class="stats"></pre>
+    </details>
+  </section>
+</main>
+
+<script type="module">
+// ---------------------------------------------------------------------------------------------
+// The wire (ADR 0003): each 20 ms Opus frame is one datagram behind a 9-byte header.
+//   0 seat (the relay writes it) | 1-2 seq | 3-6 ts, 48 kHz | 7 level, dB below full scale |
+//   8 flags: bit 0 silence, bit 1 error correction, bits 4-7 codec (0 Opus)
+// Control frames (ADR 0004) arrive on a one-way stream: a 2-byte length, then the kind. Kind 1,
+// room state: room u64, listeners u32, seat count u16, then per seat: seat u8, user u64. Kinds 2,
+// the relay list, and 3, a redirect, are the client's (crates/voice-proto, control).
+// ---------------------------------------------------------------------------------------------
+const RATE = 48000;
+const FRAME = 960;               // 20 ms at 48 kHz
+const HEADER = 9;
+const SILENT_DB = 60;            // a frame quieter than -60 dBFS is silence
+const $ = (id) => document.getElementById(id);
+
+// Capture: 128-sample blocks from the microphone, gathered into 20 ms frames.
+const CAPTURE = `
+class Capture extends AudioWorkletProcessor {
+  constructor() { super(); this.frame = new Float32Array(${FRAME}); this.at = 0; }
+  process(inputs) {
+    const input = inputs[0] && inputs[0][0];
+    if (!input) return true;
+    for (let i = 0; i < input.length; i++) {
+      this.frame[this.at++] = input[i];
+      if (this.at === ${FRAME}) {
+        this.port.postMessage(this.frame, [this.frame.buffer]);
+        this.frame = new Float32Array(${FRAME});
+        this.at = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);`;
+
+// Playout: each seat's decoded audio, mixed. The jitter is taken out before decoding (see
+// receive); this only smooths the page's own timers: each seat waits until 40 ms is queued
+// before it plays, starts over after running dry, and drops its oldest audio past 200 ms.
+const PLAYOUT = `
+const TARGET = ${FRAME * 2}, MOST = ${FRAME * 10};
+class Playout extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.seats = new Map();
+    this.port.onmessage = (e) => {
+      const { seat, pcm } = e.data;
+      let s = this.seats.get(seat);
+      if (!s) { s = { chunks: [], at: 0, queued: 0, playing: false, under: 0 }; this.seats.set(seat, s); }
+      s.chunks.push(pcm); s.queued += pcm.length;
+      while (s.queued - s.at > MOST && s.chunks.length > 1) { s.queued -= s.chunks[0].length; s.chunks.shift(); s.at = 0; }
+    };
+  }
+  process(_, outputs) {
+    const out = outputs[0][0];
+    out.fill(0);
+    for (const s of this.seats.values()) {
+      const have = s.queued - s.at;
+      if (!s.playing) { if (have >= TARGET) s.playing = true; else continue; }
+      for (let i = 0; i < out.length; i++) {
+        const chunk = s.chunks[0];
+        if (!chunk) { s.playing = false; s.under++; break; }
+        out[i] += chunk[s.at++];
+        if (s.at === chunk.length) { s.chunks.shift(); s.queued -= chunk.length; s.at = 0; }
+      }
+    }
+    for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, out[i]));
+    return true;
+  }
+}
+registerProcessor('playout', Playout);`;
+
+const state = {
+  context: null, encoder: null, source: null, stream: null,
+  muted: false, seq: 0, me: null, token: null, epoch: 0n, t0: 0, ticking: null,
+  playing: null, turn: 0,  // the playout timer, and the next 20 ms turn on the page's clock
+  sessions: new Map(),   // "ip:port" -> { key, ip, port, transport, writer }
+  current: null,         // the session the client is joined at, by key
+  relays: [],            // the last relay list, for the numbers
+  decoders: new Map(),   // seat -> { decoder, count }
+  levels: new Map(),     // seat -> { db, at }
+  stats: { sent: 0, received: 0, played: 0, lost: 0, late: 0, bytesOut: 0, bytesIn: 0, moves: 0 },
+  room: null,
+};
+
+function hexBytes(hex) {
+  const clean = hex.trim().toLowerCase();
+  if (!/^([0-9a-f]{2})+$/.test(clean)) return null;
+  return Uint8Array.from(clean.match(/../g), (pair) => parseInt(pair, 16));
+}
+
+function setStatus(text, bad = false) {
+  $('status').textContent = text;
+  $('status').className = bad ? 'bad' : '';
+}
+
+// The link carries the settings after '#', which the browser never sends to the web server.
+function readFragment() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  for (const key of ['relay', 'hash', 'token']) if (params.get(key)) $(key).value = params.get(key);
+}
+
+function missingFeatures() {
+  const missing = [];
+  if (!('WebTransport' in window)) missing.push('WebTransport');
+  if (!('AudioEncoder' in window)) missing.push('WebCodecs AudioEncoder');
+  if (!('AudioDecoder' in window)) missing.push('WebCodecs AudioDecoder');
+  if (!window.AudioWorkletNode) missing.push('AudioWorklet');
+  return missing;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The client (ADRs 0010, 0011): which relay to join, whether it is there, and when to move are
+// voice-client's, the Rust the simulator runs, compiled to WebAssembly (crates/voice-web). This
+// page only carries out what it says, and tells it what happened.
+// ---------------------------------------------------------------------------------------------
+const JOIN = 1, LEAVE = 2, PING = 3;
+const RELAY_BYTES = 38;          // address 4, port 2, certificate hash 32
+// voice-web's jitter buffer: what a push and a turn say (crates/voice-web/src/lib.rs).
+const LATE = 2;
+const FRAME_OUT = 1, LOST = 2, LOST_WITH_NEXT = 3;
+const OPUS_MAX = 1275;
+let wasm = null;
+
+async function loadClient() {
+  const { instance } = await WebAssembly.instantiateStreaming(fetch('voice.wasm'), {});
+  wasm = instance.exports;
+}
+
+const shared = (len) => new Uint8Array(wasm.memory.buffer, wasm.buffer(), len);
+const clock = () => Math.floor(performance.now() - state.t0) >>> 0;
+const ipNumber = (ip) => ip.split('.').reduce((n, part) => (n * 256) + Number(part), 0) >>> 0;
+const ipText = (n) => [24, 16, 8, 0].map((shift) => (n >>> shift) & 255).join('.');
+
+// A relay as the buffer carries it: address, port, and for a join, its hash.
+function relayInBuffer(withHash) {
+  const bytes = shared(RELAY_BYTES).slice();
+  const view = new DataView(bytes.buffer);
+  const ip = ipText(view.getUint32(0));
+  const port = view.getUint16(4);
+  return { ip, port, key: `${ip}:${port}`, hash: withHash ? bytes.slice(6) : null };
+}
+
+// Tells the client what happened at a session, then does what it says.
+function tell(call, session) {
+  if (!wasm || !state.ticking) return;
+  wasm[call](clock(), ipNumber(session.ip), session.port);
+  act();
+}
+
+function act() {
+  for (let kind = wasm.poll(); kind !== 0; kind = wasm.poll()) {
+    const relay = relayInBuffer(kind === JOIN);
+    if (kind === JOIN) open(relay);
+    else if (kind === LEAVE) close(relay.key);
+    else if (kind === PING) ping(relay.key);
+  }
+  const joined = wasm.relay() === 1 ? relayInBuffer(false).key : null;
+  if (joined !== state.current) {
+    if (state.current && joined) state.stats.moves++;
+    state.current = joined;
+    setStatus(joined ? `In the room, through ${joined}.` : 'Finding a relay…', !joined);
+  }
+}
+
+// Opens a session at `relay`: the join. The client hears back when it opens, fails or ends.
+function open(relay) {
+  if (state.sessions.has(relay.key)) return;
+  const url = `https://${relay.key}/?token=${state.token}&epoch=${state.epoch}`;
+  let transport;
+  try {
+    transport = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: relay.hash }] });
+  } catch (_) {
+    return tell('failed', relay);
+  }
+  const session = { ...relay, transport, writer: null };
+  state.sessions.set(relay.key, session);
+  transport.ready.then(() => {
+    if (state.sessions.get(relay.key) !== session) return;
+    session.writer = transport.datagrams.writable.getWriter();
+    readDatagrams(session);
+    readStreams(session);
+    tell('joined', session);
+  }, () => {
+    if (state.sessions.get(relay.key) !== session) return;
+    state.sessions.delete(relay.key);
+    tell('failed', session);
+  });
+  transport.closed.catch(() => {}).finally(() => {
+    if (state.sessions.get(relay.key) !== session) return;
+    state.sessions.delete(relay.key);
+    tell('closed', session);
+  });
+}
+
+function close(key) {
+  const session = state.sessions.get(key);
+  if (!session) return;
+  state.sessions.delete(key);
+  try { session.transport.close({ closeCode: 0, reason: 'moved' }); } catch (_) { /* never opened */ }
+}
+
+// A ping: a datagram shorter than an audio header, which the relay sends straight back.
+function ping(key) {
+  const session = state.sessions.get(key);
+  if (session && session.writer) session.writer.write(new Uint8Array([0])).catch(() => {});
+}
+
+async function join() {
+  const missing = missingFeatures();
+  if (missing.length) return setStatus(`This browser lacks ${missing.join(', ')}.`, true);
+  const relay = $('relay').value.trim();
+  const hash = hexBytes($('hash').value);
+  const token = $('token').value.trim();
+  const fields = hexBytes(token);
+  const [ip, port] = relay.split(':');
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip || '') || !Number(port) || !hash || hash.length !== 32 || !fields || fields.length !== 99) {
+    return setStatus('Fill in the relay as address:port, a 64-digit hash and the token.', true);
+  }
+  location.hash = new URLSearchParams({ relay, hash: $('hash').value.trim(), token }).toString();
+  // The token's fields: format 1, user 8, room 8, ... (crates/voice-token).
+  const view = new DataView(fields.buffer);
+  state.me = Number(view.getBigUint64(1));
+  state.token = token;
+  $('join').disabled = true;
+  setStatus('Starting audio…');
+  try {
+    if (!wasm) await loadClient();
+    await startAudio();
+  } catch (error) {
+    $('join').disabled = false;
+    return setStatus(`Could not start: ${error.message || error}`, true);
+  }
+  // The relay to join first goes in the buffer, then the client starts.
+  const first = shared(RELAY_BYTES);
+  new DataView(first.buffer, first.byteOffset).setUint32(0, ipNumber(ip));
+  new DataView(first.buffer, first.byteOffset).setUint16(4, Number(port));
+  first.set(hash, 6);
+  const seed = new BigUint64Array(1);
+  crypto.getRandomValues(seed);
+  state.t0 = performance.now();
+  wasm.start(view.getBigUint64(9), 0, seed[0], 0, 1);
+  state.ticking = setInterval(() => { wasm.tick(clock()); act(); }, 10);
+  state.turn = 0;
+  state.playing = setInterval(playout, 5);
+  wasm.tick(0);
+  act();
+  $('leave').disabled = false;
+  $('mute').disabled = false;
+}
+
+async function startAudio() {
+  const context = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
+  state.context = context;
+  if (context.sampleRate !== RATE) throw new Error(`audio runs at ${context.sampleRate} Hz, not 48000`);
+  const url = (code) => URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+  await context.audioWorklet.addModule(url(CAPTURE));
+  await context.audioWorklet.addModule(url(PLAYOUT));
+  const playout = new AudioWorkletNode(context, 'playout', { outputChannelCount: [1] });
+  playout.connect(context.destination);
+  state.playout = playout;
+
+  let source;
+  if ($('tone').checked) {
+    const tone = context.createOscillator();
+    tone.frequency.value = 440;
+    const gain = context.createGain();
+    gain.gain.value = 0.1;
+    tone.connect(gain);
+    tone.start();
+    source = gain;
+  } else {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+    state.stream = stream;
+    source = context.createMediaStreamSource(stream);
+  }
+  const capture = new AudioWorkletNode(context, 'capture', { numberOfInputs: 1, numberOfOutputs: 0 });
+  source.connect(capture);
+  state.source = source;
+
+  const encoder = new AudioEncoder({
+    output: (chunk) => send(chunk),
+    error: (error) => setStatus(`Encoder: ${error.message}`, true),
+  });
+  encoder.configure({
+    codec: 'opus', sampleRate: RATE, numberOfChannels: 1, bitrate: 32000,
+    opus: { frameDuration: 20000, useinbandfec: true, packetlossperc: 5 },
+  });
+  state.encoder = encoder;
+  state.pendingLevels = [];
+  capture.port.onmessage = (e) => {
+    const pcm = e.data;
+    const db = levelOf(pcm);
+    $('me').style.width = `${Math.max(0, 100 - db * 100 / SILENT_DB)}%`;
+    if (state.muted || encoder.state !== 'configured') return;
+    state.pendingLevels.push(db);
+    encoder.encode(new AudioData({
+      format: 'f32-planar', sampleRate: RATE, numberOfFrames: FRAME, numberOfChannels: 1,
+      timestamp: state.seq * 20000, data: pcm,
+    }));
+  };
+}
+
+// dB below full scale of a frame, 0 to 127 (RFC 6464): 0 is the loudest.
+function levelOf(pcm) {
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+  const rms = Math.sqrt(sum / pcm.length);
+  if (rms <= 0) return 127;
+  return Math.max(0, Math.min(127, Math.round(-20 * Math.log10(rms))));
+}
+
+// A frame goes to the relay the client is joined at; while it moves, still to the old one.
+function send(chunk) {
+  const db = state.pendingLevels.shift() ?? 127;
+  const session = state.current && state.sessions.get(state.current);
+  if (!session || !session.writer) return;
+  const datagram = new Uint8Array(HEADER + chunk.byteLength);
+  const view = new DataView(datagram.buffer);
+  const seq = state.seq & 0xffff;
+  view.setUint8(0, 0);
+  view.setUint16(1, seq);
+  view.setUint32(3, (state.seq * FRAME) >>> 0);
+  view.setUint8(7, db);
+  view.setUint8(8, (db >= SILENT_DB ? 1 : 0) | 2);
+  chunk.copyTo(datagram.subarray(HEADER));
+  state.seq = (state.seq + 1) >>> 0;
+  state.stats.sent++;
+  state.stats.bytesOut += datagram.byteLength;
+  session.writer.write(datagram).catch(() => {});
+  wasm.sent(clock());
+}
+
+async function readDatagrams(session) {
+  const reader = session.transport.datagrams.readable.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      // Anything from the relay shows it is there, a ping's echo included.
+      tell('heard', session);
+      receive(value);
+    }
+  } catch (_) { /* the session ended */ }
+}
+
+// A speaker's frames go through their jitter buffer in the WebAssembly (crates/voice-audio,
+// ADR 0014): put back in order, repeats dropped, and played at a delay that follows the
+// network's jitter. While the client moves, the same frame can come from both relays: the
+// second is a repeat, or too late.
+function receive(datagram) {
+  if (datagram.byteLength < HEADER) return;
+  const view = new DataView(datagram.buffer, datagram.byteOffset, datagram.byteLength);
+  const seat = view.getUint8(0);
+  const seq = view.getUint16(1);
+  const db = view.getUint8(7);
+  state.stats.received++;
+  state.stats.bytesIn += datagram.byteLength;
+  state.levels.set(seat, { db, at: performance.now() });
+  if (!state.decoders.has(seat)) state.decoders.set(seat, newSpeaker(seat));
+  const opus = datagram.subarray(HEADER);
+  if (opus.byteLength > OPUS_MAX) return;
+  shared(opus.byteLength).set(opus);
+  if (wasm.jitter_push(seat, seq, opus.byteLength, clock()) === LATE) state.stats.late++;
+}
+
+// Every 20 ms on the page's clock, each seat's turn: a frame to decode, or one lost, played
+// silent for now (rebuilding it from the next frame's FEC needs our own Opus decoder), or
+// nothing yet. A tab put to sleep starts again from now.
+function playout() {
+  const now = clock();
+  if (now - state.turn > 200) state.turn = now;
+  while (state.turn <= now) {
+    for (const [seat, speaker] of state.decoders) {
+      const said = wasm.jitter_pop(seat, state.turn);
+      const kind = said & 3;
+      if (kind === FRAME_OUT) {
+        state.stats.played++;
+        decode(speaker, shared(said >>> 2).slice());
+      } else if (kind === LOST || kind === LOST_WITH_NEXT) {
+        state.stats.lost++;
+        state.playout.port.postMessage({ seat, pcm: new Float32Array(FRAME) });
+      }
+    }
+    state.turn += 20;
+  }
+}
+
+function newSpeaker(seat) {
+  const decoder = new AudioDecoder({
+    output: (audio) => {
+      const pcm = new Float32Array(audio.numberOfFrames);
+      if (audio.format.startsWith('f32')) {
+        audio.copyTo(pcm, { planeIndex: 0 });
+      } else {
+        const ints = new Int16Array(audio.numberOfFrames);
+        audio.copyTo(ints, { planeIndex: 0 });
+        for (let i = 0; i < ints.length; i++) pcm[i] = ints[i] / 32768;
+      }
+      audio.close();
+      state.playout.port.postMessage({ seat, pcm }, [pcm.buffer]);
+    },
+    error: (error) => setStatus(`Decoder: ${error.message}`, true),
+  });
+  decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
+  return { decoder, count: 0 };
+}
+
+function decode(speaker, opus) {
+  if (speaker.decoder.state !== 'configured') return;
+  speaker.decoder.decode(new EncodedAudioChunk({
+    type: 'key', timestamp: (speaker.count++) * 20000, data: opus,
+  }));
+}
+
+async function readStreams(session) {
+  const streams = session.transport.incomingUnidirectionalStreams.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await streams.read();
+      if (done) return;
+      readFrames(session, value);
+    }
+  } catch (_) { /* the session ended */ }
+}
+
+// The relay's control frames (ADR 0004): a 2-byte length, then the kind and its fields.
+async function readFrames(session, stream) {
+  const reader = stream.getReader();
+  let buffer = new Uint8Array(0);
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      tell('heard', session);
+      const joined = new Uint8Array(buffer.length + value.length);
+      joined.set(buffer);
+      joined.set(value, buffer.length);
+      buffer = joined;
+      for (;;) {
+        if (buffer.length < 2) break;
+        const len = (buffer[0] << 8) | buffer[1];
+        if (buffer.length < 2 + len) break;
+        controlFrame(session, buffer.subarray(2, 2 + len));
+        buffer = buffer.slice(2 + len);
+      }
+    }
+  } catch (_) { /* the session ended */ }
+}
+
+// Room state is the page's to draw; the relay list (kind 2) and redirects (kind 3) are the
+// client's.
+function controlFrame(session, body) {
+  if (body[0] === 2 || body[0] === 3) {
+    if (body.length > 952) return;
+    shared(body.length).set(body);
+    const taken = wasm.frame(clock(), ipNumber(session.ip), session.port, body.length);
+    if (taken && body[0] === 2) noteRelays(body);
+    act();
+    return;
+  }
+  roomState(body);
+}
+
+// The list's epoch goes with every join; its relays, into the numbers.
+function noteRelays(body) {
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const epoch = view.getBigUint64(1);
+  if (epoch <= state.epoch) return;
+  state.epoch = epoch;
+  const relays = [];
+  for (let i = 0, at = 10; i < body[9] && at + 47 <= body.length; i++, at += 47) {
+    relays.push(`${ipText(view.getUint32(at + 8))}:${view.getUint16(at + 12)}${body[at + 14] ? ' (draining)' : ''}`);
+  }
+  state.relays = relays;
+}
+
+function roomState(body) {
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  if (body.length < 15 || view.getUint8(0) !== 1) return;
+  const room = view.getBigUint64(1);
+  const listeners = view.getUint32(9);
+  const count = view.getUint16(13);
+  const seats = [];
+  for (let i = 0; i < count && 15 + i * 9 + 9 <= body.length; i++) {
+    seats.push({ seat: view.getUint8(15 + i * 9), user: Number(view.getBigUint64(16 + i * 9)) });
+  }
+  state.room = { room, listeners, seats };
+  drawRoom();
+}
+
+function drawRoom() {
+  const room = state.room;
+  if (!room) return;
+  $('room').textContent = `Room ${room.room} · ${room.seats.length} speaking · ${room.listeners} listening`;
+  $('seats').replaceChildren(...room.seats.map(({ seat, user }) => {
+    const card = document.createElement('div');
+    card.className = 'seat';
+    card.dataset.seat = seat;
+    const who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = user === state.me ? `You (${user})` : `User ${user}`;
+    const n = document.createElement('div');
+    n.className = 'n';
+    n.textContent = `seat ${seat}`;
+    card.append(who, n);
+    return card;
+  }));
+}
+
+// Speaking rings, from each datagram's level: the relay never decodes, nor does this.
+setInterval(() => {
+  const now = performance.now();
+  for (const card of document.querySelectorAll('.seat')) {
+    const level = state.levels.get(Number(card.dataset.seat));
+    card.classList.toggle('speaking', !!level && now - level.at < 300 && level.db < 45);
+  }
+  const s = state.stats;
+  $('stats').textContent =
+    `sent ${s.sent} frames, ${(s.bytesOut / 1024).toFixed(1)} KB\n` +
+    `received ${s.received} frames, ${(s.bytesIn / 1024).toFixed(1)} KB\n` +
+    `played ${s.played}, lost ${s.lost}, too late ${s.late}\n` +
+    `relay ${state.current ?? 'none'}, moved ${s.moves} times\n` +
+    `relays at epoch ${state.epoch}: ${state.relays.join(', ') || 'no list yet'}`;
+}, 100);
+
+function leave() {
+  clearInterval(state.ticking);
+  clearInterval(state.playing);
+  wasm.jitter_clear();
+  state.ticking = null;
+  for (const key of [...state.sessions.keys()]) close(key);
+  for (const speaker of state.decoders.values()) if (speaker.decoder.state !== 'closed') speaker.decoder.close();
+  state.decoders.clear();
+  if (state.encoder && state.encoder.state !== 'closed') state.encoder.close();
+  if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
+  if (state.context) state.context.close();
+  Object.assign(state, { encoder: null, context: null, stream: null, seq: 0, current: null });
+  $('join').disabled = false;
+  $('leave').disabled = true;
+  $('mute').disabled = true;
+  setStatus('Left the room.');
+}
+
+$('join').onclick = join;
+$('leave').onclick = leave;
+$('mute').onclick = () => {
+  state.muted = !state.muted;
+  $('mute').textContent = state.muted ? 'Unmute' : 'Mute';
+};
+readFragment();
+const missing = missingFeatures();
+if (missing.length) setStatus(`This browser lacks ${missing.join(', ')}.`, true);
+</script>
+</body>
+</html>
