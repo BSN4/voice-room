@@ -497,14 +497,17 @@ function levelOf(pcm) {
 }
 
 // A frame goes to the relay the client is joined at; while it moves, still to the old one. With
-// no relay it goes nowhere, its number spent.
+// no relay it goes nowhere, its number spent. Silence goes nowhere either (frames.js, ADR 0021):
+// with nothing to send, the client keeps the relay hearing from it with its keepalives.
 function send(chunk) {
-  const datagram = outgoing.encoded(chunk);
+  const datagrams = outgoing.encoded(chunk);
   const session = state.current && sessions.get(state.current);
-  if (!datagram || !session || !session.writer) return;
-  state.stats.sent++;
-  session.writer.write(datagram).catch(() => {});
-  wasm.sent(clock());
+  if (!session || !session.writer) return;
+  for (const datagram of datagrams) {
+    state.stats.sent++;
+    session.writer.write(datagram).catch(() => {});
+    wasm.sent(clock());
+  }
 }
 
 async function readDatagrams(session) {
