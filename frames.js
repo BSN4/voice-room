@@ -5,7 +5,9 @@
 // relay to send to, the numbers go on, so a listener's jitter buffer (ADR 0014) sees from the
 // numbers that time passed, not a frame suddenly seconds late.
 //
-// Silence is not sent (ADR 0021). A frame louder than VOICE_DB is speech; the page sends speech,
+// Silence is not sent (ADR 0021). A frame the denoiser scores SPEECH or more holds speech (ADR
+// 0022); without its score, as with the test tone, a frame louder than VOICE_DB does. The page
+// sends speech,
 // the HOLD frames after it, so the end of a word is not cut off, and the one frame before it, so
 // its first sound is not either. The encoder still gets every frame, so it never starts cold.
 // A frame the page sends is never marked silent: the relay copies a silent frame to no one.
@@ -16,6 +18,7 @@ export const FRAME = 960;        // 20 ms at 48 kHz
 export const SILENT_DB = 60;     // a frame quieter than -60 dBFS is silence, for the level meter
 export const VOICE_DB = 50;      // a frame louder than -50 dBFS is speech
 export const HOLD = 12;          // frames sent on after the last speech: 240 ms
+export const SPEECH = 0.5;       // the denoiser's score from which a frame holds speech
 
 export class Outgoing {
   constructor() {
@@ -25,10 +28,11 @@ export class Outgoing {
     this.held = null;            // the last frame not sent, to go first when speech starts
   }
 
-  // A frame the microphone gave, `db` loud: it takes the next number. Returns the number, for
-  // the encoder, or null when the encoder is not to have it (`encode` false: muted, or no
-  // encoder), which ends any talking.
-  captured(db, encode) {
+  // A frame the microphone gave, `db` loud, and the denoiser's score of how likely it holds
+  // speech, or null without one: it takes the next number. Returns the number, for the encoder,
+  // or null when the encoder is not to have it (`encode` false: muted, or no encoder), which ends
+  // any talking.
+  captured(db, encode, voice = null) {
     const seq = this.seq;
     this.seq = (this.seq + 1) >>> 0;
     if (!encode) {
@@ -36,7 +40,8 @@ export class Outgoing {
       this.held = null;
       return null;
     }
-    this.quiet = db < VOICE_DB ? 0 : Math.min(this.quiet + 1, HOLD + 1);
+    const speech = voice === null ? db < VOICE_DB : voice >= SPEECH;
+    this.quiet = speech ? 0 : Math.min(this.quiet + 1, HOLD + 1);
     this.pending.push({ seq, db, send: this.quiet <= HOLD });
     return seq;
   }

@@ -66,6 +66,7 @@
     <div class="buttons">
       <button id="join" class="primary" disabled>Join the call</button>
       <button id="mute" hidden>Mute</button>
+      <button id="filter" hidden>Noise filter: on</button>
       <button id="leave" hidden>Leave</button>
     </div>
     <div id="mic" class="mic" hidden>Your microphone<div class="meter"><div id="me"></div></div></div>
@@ -88,6 +89,8 @@
 import { Sessions, why } from './sessions.js';
 import { Output, leaveLockScreen, lockScreen, sayItIsACall, sayTheCallIsOver } from './background.js';
 import { FRAME, HEADER, Outgoing, SILENT_DB } from './frames.js';
+// The capture worklet's denoiser (crates/voice-denoise, ADR 0022): 10 ms of samples a call.
+const SAMPLES = 480;
 import { Decoders } from './decoders.js';
 import { EXPIRED, cantGetIn, expired, hexBytes, readLink } from './link.js';
 import { personId } from './person.js';
@@ -116,14 +119,66 @@ const $ = (id) => document.getElementById(id);
 // Capture: 128-sample blocks from the microphone, gathered into 20 ms frames.
 const CAPTURE = `
 class Capture extends AudioWorkletProcessor {
-  constructor() { super(); this.frame = new Float32Array(${FRAME}); this.at = 0; }
+  constructor() {
+    super();
+    this.frame = new Float32Array(${FRAME});
+    this.at = 0;
+    // The denoiser (ADR 0022), once the page sends its module: none for the test tone, or where
+    // it cannot run. Its samples' view is made again if its memory grows.
+    this.denoiser = null;
+    this.view = null;
+    this.apply = true;
+    // The module comes as its bytes, compiled here: Chrome will not pass a compiled module
+    // into an audio worklet, and says so only with a messageerror.
+    this.port.onmessage = (e) => {
+      const { bytes, apply } = e.data;
+      if (apply !== undefined) this.apply = apply;
+      if (!bytes) return;
+      try {
+        this.denoiser = new WebAssembly.Instance(new WebAssembly.Module(bytes), {}).exports;
+        this.port.postMessage({ ready: true });
+      } catch (error) {
+        this.port.postMessage({ failed: String(error) });
+      }
+    };
+    this.port.onmessageerror = () => this.port.postMessage({ failed: 'a message the audio thread could not read' });
+  }
+  // The denoiser's samples, as a view made again whenever its memory has grown: a call can grow
+  // it, as the first does, and the old view then reads nothing.
+  samples() {
+    const d = this.denoiser;
+    if (!this.view || this.view.buffer !== d.memory.buffer) {
+      this.view = new Float32Array(d.memory.buffer, d.samples(), ${SAMPLES});
+    }
+    return this.view;
+  }
+  // Each half of a frame through the denoiser: denoised in place when it is on, and scored for
+  // speech either way. The frame's score is its likelier half's; null without a denoiser. A
+  // denoiser that fails is let go, and the call goes on without it.
+  clean(frame) {
+    if (!this.denoiser) return null;
+    try {
+      let voice = 0;
+      for (let half = 0; half < ${FRAME}; half += ${SAMPLES}) {
+        this.samples().set(frame.subarray(half, half + ${SAMPLES}));
+        voice = Math.max(voice, this.denoiser.denoise(this.apply ? 1 : 0));
+        if (this.apply) frame.set(this.samples(), half);
+      }
+      return voice;
+    } catch (error) {
+      this.denoiser = null;
+      this.port.postMessage({ failed: String(error) });
+      return null;
+    }
+  }
   process(inputs) {
     const input = inputs[0] && inputs[0][0];
     if (!input) return true;
     for (let i = 0; i < input.length; i++) {
       this.frame[this.at++] = input[i];
       if (this.at === ${FRAME}) {
-        this.port.postMessage(this.frame, [this.frame.buffer]);
+        const voice = this.clean(this.frame);
+        this.port.postMessage({ pcm: this.frame, voice }, [this.frame.buffer]);
         this.frame = new Float32Array(${FRAME});
         this.at = 0;
       }
@@ -175,6 +230,9 @@ registerProcessor('playout', Playout);`;
 
 const state = {
   link: null, token: null, invite: null, person: null, me: null, room: null, tone: false, webaudio: false,
+  denoise: null,         // the denoiser's module, as bytes, or null where it will not load
+  filter: true,          // whether the noise filter is on: this device's last choice
+  capture: null,         // the capture worklet, to tell the filter's switch
   people: null,          // the channel this page's tabs ask each other about person ids on
   relays: [], tried: 0, output: null,
   call: false,           // whether WebKit was told this is a call (background.js)
@@ -439,8 +497,11 @@ async function startAudio() {
     tone.start();
     source = gain;
   } else {
+    // While our noise filter runs, the browser's own suppression stays off, so the two never
+    // work on the same sound; echo cancellation and gain control stay on.
+    const ours = !!state.denoise && state.filter;
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      audio: { echoCancellation: true, noiseSuppression: !ours, autoGainControl: true, channelCount: 1 },
     });
     state.stream = stream;
     // What the browser does to the microphone, in the background above all, goes in the log.
@@ -459,8 +520,17 @@ async function startAudio() {
     });
   }
   const capture = new AudioWorkletNode(context, 'capture', { numberOfInputs: 1, numberOfOutputs: 0 });
+  capture.onprocessorerror = () => note('the microphone’s worklet stopped: nothing more goes out');
   source.connect(capture);
   state.source = source;
+  state.capture = capture;
+  // The denoiser runs in the worklet, on the audio thread, as its own module; not on the test
+  // tone, which is no speech and would be filtered away.
+  if (state.denoise && !state.tone) {
+    capture.port.postMessage({ bytes: state.denoise, apply: state.filter });
+    $('filter').hidden = false;
+    drawFilter();
+  }
 
   const encoder = new AudioEncoder({
     output: (chunk) => send(chunk),
@@ -473,12 +543,20 @@ async function startAudio() {
   state.encoder = encoder;
   outgoing.restart();
   capture.port.onmessage = (e) => {
-    const pcm = e.data;
+    const { pcm, voice, ready, failed } = e.data;
+    if (ready) return note(`noise filter ${state.filter ? 'on' : 'off'}`);
+    if (failed) {
+      // Without ours, the browser's own suppression comes back where it lets a call change it.
+      $('filter').hidden = true;
+      const track = state.stream && state.stream.getAudioTracks()[0];
+      if (track) track.applyConstraints({ noiseSuppression: true }).catch(() => {});
+      return note(`the noise filter stopped (${failed}): the browser's own is back where it can be`);
+    }
     const db = levelOf(pcm);
     $('me').style.width = state.muted ? '0%' : `${Math.max(0, 100 - db * 100 / SILENT_DB)}%`;
     // Every frame takes a number, muted or not: listeners see from the numbers how long the
     // page was quiet.
-    const seq = outgoing.captured(db, !state.muted && encoder.state === 'configured');
+    const seq = outgoing.captured(db, !state.muted && encoder.state === 'configured', voice);
     if (seq === null) return;
     encoder.encode(new AudioData({
       format: 'f32-planar', sampleRate: RATE, numberOfFrames: FRAME, numberOfChannels: 1,
@@ -727,7 +805,7 @@ function stopAudio() {
     leaveLockScreen(navigator.mediaSession);
     sayTheCallIsOver(navigator);
   }
-  Object.assign(state, { encoder: null, context: null, stream: null, playout: null, output: null, call: false });
+  Object.assign(state, { encoder: null, context: null, stream: null, playout: null, output: null, call: false, capture: null });
 }
 
 function leave() {
@@ -742,6 +820,7 @@ function leave() {
   $('join').hidden = false;
   $('join').disabled = false;
   $('mute').hidden = true;
+  $('filter').hidden = true;
   $('leave').hidden = true;
   $('mic').hidden = true;
   $('peoplecard').hidden = true;
@@ -775,6 +854,21 @@ function setMuted(muted) {
   $('mute').textContent = muted ? 'Unmute' : 'Mute';
 }
 $('mute').onclick = () => setMuted(!state.muted);
+
+// The noise filter's switch (ADR 0022): it takes effect at once, and this device remembers it.
+// Off, the browser's own suppression comes back where the browser lets a call change it.
+function drawFilter() {
+  $('filter').textContent = `Noise filter: ${state.filter ? 'on' : 'off'}`;
+}
+$('filter').onclick = () => {
+  state.filter = !state.filter;
+  try { localStorage.setItem('voice-filter', state.filter ? 'on' : 'off'); } catch (_) { /* kept for this visit only */ }
+  if (state.capture) state.capture.port.postMessage({ apply: state.filter });
+  const track = state.stream && state.stream.getAudioTracks()[0];
+  if (track) track.applyConstraints({ noiseSuppression: !state.filter }).catch(() => {});
+  drawFilter();
+  note(`noise filter ${state.filter ? 'on' : 'off'}`);
+};
 
 // In a call, the page going to the background and coming back goes in the log: what iOS does to
 // a call then is still being learned (ADR 0019). Back in front, audio the browser stopped picks
@@ -812,8 +906,18 @@ async function boot() {
   } else {
     note(`room ${state.room}, by a token: you are user ${state.me}`);
   }
+  try { state.filter = localStorage.getItem('voice-filter') !== 'off'; } catch (_) { /* on */ }
+  // The denoiser loads while the rest does, checked here and compiled in the worklet; without
+  // it, or in a browser without WebAssembly SIMD, the call goes on as before.
+  const denoise = fetch('denoise.wasm')
+    .then((response) => (response.ok ? response.arrayBuffer() : Promise.reject(new Error(`HTTP ${response.status}`))))
+    .then((bytes) => {
+      if (!WebAssembly.validate(bytes)) throw new Error('this browser cannot run it');
+      state.denoise = bytes;
+    })
+    .catch((error) => note(`no noise filter: ${why(error)}`));
   try {
-    await Promise.all([loadClient(), loadRelays()]);
+    await Promise.all([loadClient(), loadRelays(), denoise]);
   } catch (_) {
     return say('The call isn’t set up right now: no voice servers are listed. Ask whoever set it up.', true);
   }
