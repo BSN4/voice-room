@@ -86,31 +86,29 @@
 
 <script type="module">
 import { Sessions, why } from './sessions.js';
-import { Output, lockScreen, sayItIsACall } from './background.js';
+import { Output, leaveLockScreen, lockScreen, sayItIsACall, sayTheCallIsOver } from './background.js';
+import { FRAME, HEADER, Outgoing, SILENT_DB } from './frames.js';
+import { Decoders } from './decoders.js';
+import { EXPIRED, cantGetIn, expired, hexBytes, readLink } from './link.js';
+import { personId } from './person.js';
 
 // ---------------------------------------------------------------------------------------------
 // The link is the page's address, then '#', then the room's invite (ADR 0016): one link for
-// everyone in the call. The browser never sends what follows '#' to any server. A person's own
-// token still works in its place, as older links have it. Which relays to use comes from
-// relays.json beside the page, which lab/aws.sh call writes. Add '&tone' after the invite to send
-// a 440 Hz tone instead of the microphone, for testing, and '&webaudio' to leave out what keeps a
-// call going in Safari's background (background.js, ADR 0019), to compare.
+// everyone in the call (link.js). The browser never sends what follows '#' to any server. Which
+// relays to use comes from relays.json beside the page, which lab/aws.sh call writes. Add '&tone'
+// after the invite to send a 440 Hz tone instead of the microphone, for testing, and '&webaudio'
+// to leave out what keeps a call going in Safari's background (background.js, ADR 0019).
 //
-// With an invite, the page keeps a random person id for this tab, so a reload is the same person
-// and gets their seat back, and sends it with the invite. The relay knows the person by a hash of
-// it, which room state shows: the page works out the same hash to find itself there.
+// With an invite, the page keeps a random person id for this tab (person.js), so a reload is the
+// same person and gets their seat back, and sends it with the invite. The relay knows the person
+// by a hash of it, which room state shows: the page works out the same hash to find itself there.
 //
-// The wire (ADR 0003): each 20 ms Opus frame is one datagram behind a 9-byte header.
-//   0 seat (the relay writes it) | 1-2 seq | 3-6 ts, 48 kHz | 7 level, dB below full scale |
-//   8 flags: bit 0 silence, bit 1 error correction, bits 4-7 codec (0 Opus)
+// The wire (ADR 0003): each 20 ms Opus frame is one datagram behind a 9-byte header (frames.js).
 // Control frames (ADR 0004) arrive on a one-way stream: a 2-byte length, then the kind. Kind 1,
 // room state: room u64, listeners u32, seat count u16, then per seat: seat u8, user u64. Kinds 2,
 // the relay list, and 3, a redirect, are the client's (crates/voice-proto, control).
 // ---------------------------------------------------------------------------------------------
 const RATE = 48000;
-const FRAME = 960;               // 20 ms at 48 kHz
-const HEADER = 9;
-const SILENT_DB = 60;            // a frame quieter than -60 dBFS is silence
 const TALKING_DB = 45;           // louder than -45 dBFS lights a person up
 const GIVE_UP_MS = 6000;         // a relay that has not let us in by then: try the next
 const $ = (id) => document.getElementById(id);
@@ -176,24 +174,23 @@ class Playout extends AudioWorkletProcessor {
 registerProcessor('playout', Playout);`;
 
 const state = {
-  token: null, invite: null, person: null, me: null, room: null, tone: false, webaudio: false,
+  link: null, token: null, invite: null, person: null, me: null, room: null, tone: false, webaudio: false,
+  people: null,          // the channel this page's tabs ask each other about person ids on
   relays: [], tried: 0, output: null,
+  call: false,           // whether WebKit was told this is a call (background.js)
   context: null, encoder: null, source: null, stream: null, playout: null,
-  muted: false, seq: 0, epoch: 0n, t0: 0, ticking: null, since: 0,
+  muted: false, epoch: 0n, t0: 0, ticking: null, since: 0,
   current: null,         // the session the client is joined at, by key
   listed: [],            // the last relay list, for the details
-  decoders: new Map(),   // seat -> { decoder, count }
   levels: new Map(),     // seat -> { db, at }
   roomState: null,
   seat: null,            // this page's own seat, from room state
   stats: { sent: 0, received: 0, played: 0, lost: 0, late: 0, moves: 0 },
 };
-
-function hexBytes(hex) {
-  const clean = hex.trim().toLowerCase();
-  if (!/^([0-9a-f]{2})+$/.test(clean)) return null;
-  return Uint8Array.from(clean.match(/../g), (pair) => parseInt(pair, 16));
-}
+// The frames this page sends: numbered as captured, sent or not (frames.js). The numbers go on
+// counting across a Leave: a listener's jitter buffer would take a speaker who starts again from
+// 0 for frames long played, until it saw them start over.
+const outgoing = new Outgoing();
 
 function say(text, bad = false) {
   if ($('status').textContent !== text) note(text);
@@ -220,47 +217,6 @@ $('details').addEventListener('toggle', () => {
 // Nothing fails unseen: any error the page did not catch goes into the log too.
 addEventListener('error', (event) => note(`page error: ${event.message}`));
 addEventListener('unhandledrejection', (event) => note(`page error: ${why(event.reason)}`));
-
-// The invite or token after '#': alone, or as 'invite=' or 'token='.
-function readLink() {
-  const fragment = location.hash.slice(1);
-  const params = new URLSearchParams(fragment);
-  const given = (params.get('invite') ?? params.get('token') ?? fragment.split('&')[0] ?? '').trim();
-  state.tone = params.has('tone');
-  state.webaudio = params.has('webaudio');
-  const fields = hexBytes(given);
-  if (!fields) return false;
-  const view = new DataView(fields.buffer);
-  // An invite's fields: format 2, room 8, expiry 8 (crates/voice-token, invite).
-  if (fields.length === 81 && fields[0] === 2) {
-    state.invite = given;
-    state.room = view.getBigUint64(1);
-    return true;
-  }
-  // A token's: format 1, user 8, room 8, ...
-  if (fields.length === 99 && fields[0] === 1) {
-    state.token = given;
-    state.me = view.getBigUint64(1);
-    state.room = view.getBigUint64(9);
-    return true;
-  }
-  return false;
-}
-
-// This tab's person id: random, kept for the tab, so a reload is the same person and another
-// tab is another. Where the browser keeps nothing, a new one each load.
-function personId() {
-  const fresh = () => crypto.getRandomValues(new BigUint64Array(1))[0];
-  try {
-    const kept = sessionStorage.getItem('voice-person');
-    if (kept && /^[0-9]{1,20}$/.test(kept) && BigInt(kept) < 2n ** 64n) return BigInt(kept);
-    const id = fresh();
-    sessionStorage.setItem('voice-person', id.toString());
-    return id;
-  } catch (_) {
-    return fresh();
-  }
-}
 
 // Who room state says a person with an invite is: the first 8 bytes of SHA-256 over
 // 'voice person v1' and the id's 8 bytes (crates/voice-token, person).
@@ -374,7 +330,7 @@ function tick() {
   if (state.current || performance.now() - state.since < GIVE_UP_MS) return;
   state.tried++;
   if (state.tried >= state.relays.length) {
-    say('Can’t reach the voice servers. Your network may block calls: try another network, such as your phone’s hotspot. Still trying…', true);
+    say(cantGetIn(state.link, Date.now()), true);
   } else {
     say('Trying another voice server…');
   }
@@ -430,7 +386,8 @@ async function join() {
     $('join').disabled = false;
     return say(micTrouble(error), true);
   }
-  note(state.tone ? 'sending a 440 Hz test tone' : `microphone on: ${state.stream.getAudioTracks()[0]?.label || 'unnamed'}`);
+  // Not the microphone's name: people are asked to copy the log and send it.
+  note(state.tone ? 'sending a 440 Hz test tone' : 'microphone on');
   $('mic').hidden = false;
   $('join').hidden = true;
   $('mute').hidden = false;
@@ -456,6 +413,7 @@ async function startAudio() {
   // it, the page is a call, played through an audio element that iOS keeps playing in the
   // background (background.js, ADR 0019).
   const call = !state.webaudio && sayItIsACall(navigator, note);
+  state.call = call;
   const context = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
   state.context = context;
   context.onstatechange = () => note(`audio: ${context.state}`);
@@ -513,16 +471,18 @@ async function startAudio() {
     opus: { frameDuration: 20000, useinbandfec: true, packetlossperc: 5 },
   });
   state.encoder = encoder;
-  state.pendingLevels = [];
+  outgoing.restart();
   capture.port.onmessage = (e) => {
     const pcm = e.data;
     const db = levelOf(pcm);
     $('me').style.width = state.muted ? '0%' : `${Math.max(0, 100 - db * 100 / SILENT_DB)}%`;
-    if (state.muted || encoder.state !== 'configured') return;
-    state.pendingLevels.push(db);
+    // Every frame takes a number, muted or not: listeners see from the numbers how long the
+    // page was quiet.
+    const seq = outgoing.captured(db, !state.muted && encoder.state === 'configured');
+    if (seq === null) return;
     encoder.encode(new AudioData({
       format: 'f32-planar', sampleRate: RATE, numberOfFrames: FRAME, numberOfChannels: 1,
-      timestamp: state.seq * 20000, data: pcm,
+      timestamp: seq * 20000, data: pcm,
     }));
   };
 }
@@ -536,21 +496,12 @@ function levelOf(pcm) {
   return Math.max(0, Math.min(127, Math.round(-20 * Math.log10(rms))));
 }
 
-// A frame goes to the relay the client is joined at; while it moves, still to the old one.
+// A frame goes to the relay the client is joined at; while it moves, still to the old one. With
+// no relay it goes nowhere, its number spent.
 function send(chunk) {
-  const db = state.pendingLevels.shift() ?? 127;
+  const datagram = outgoing.encoded(chunk);
   const session = state.current && sessions.get(state.current);
-  if (!session || !session.writer) return;
-  const datagram = new Uint8Array(HEADER + chunk.byteLength);
-  const view = new DataView(datagram.buffer);
-  const seq = state.seq & 0xffff;
-  view.setUint8(0, 0);
-  view.setUint16(1, seq);
-  view.setUint32(3, (state.seq * FRAME) >>> 0);
-  view.setUint8(7, db);
-  view.setUint8(8, (db >= SILENT_DB ? 1 : 0) | 2);
-  chunk.copyTo(datagram.subarray(HEADER));
-  state.seq = (state.seq + 1) >>> 0;
+  if (!datagram || !session || !session.writer) return;
   state.stats.sent++;
   session.writer.write(datagram).catch(() => {});
   wasm.sent(clock());
@@ -588,7 +539,7 @@ function receive(datagram) {
   if (pushed === LATE) state.stats.late++;
   state.stats.received++;
   state.levels.set(seat, { db, at: performance.now() });
-  if (!state.decoders.has(seat)) state.decoders.set(seat, newSpeaker(seat));
+  decoders.add(seat);
 }
 
 // Each 20 ms of audio, each person's turn: a frame to decode, or one lost, played silent for
@@ -596,12 +547,12 @@ function receive(datagram) {
 function turn() {
   if (!state.ticking) return;
   const now = clock();
-  for (const [seat, speaker] of state.decoders) {
+  for (const seat of decoders.seats()) {
     const said = wasm.jitter_pop(seat, now);
     const kind = said & 3;
     if (kind === FRAME_OUT) {
       state.stats.played++;
-      decode(speaker, shared(said >>> 2).slice());
+      decoders.decode(seat, shared(said >>> 2).slice());
     } else if (kind === LOST || kind === LOST_WITH_NEXT) {
       state.stats.lost++;
       state.playout.port.postMessage({ seat, pcm: new Float32Array(FRAME) });
@@ -609,32 +560,22 @@ function turn() {
   }
 }
 
-function newSpeaker(seat) {
-  const decoder = new AudioDecoder({
-    output: (audio) => {
-      const pcm = new Float32Array(audio.numberOfFrames);
-      if (audio.format.startsWith('f32')) {
-        audio.copyTo(pcm, { planeIndex: 0 });
-      } else {
-        const ints = new Int16Array(audio.numberOfFrames);
-        audio.copyTo(ints, { planeIndex: 0 });
-        for (let i = 0; i < ints.length; i++) pcm[i] = ints[i] / 32768;
-      }
-      audio.close();
-      if (state.playout) state.playout.port.postMessage({ seat, pcm }, [pcm.buffer]);
-    },
-    error: (error) => say(`Your browser’s audio decoder failed: ${error.message}`, true),
-  });
-  decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
-  return { decoder, count: 0 };
-}
-
-function decode(speaker, opus) {
-  if (speaker.decoder.state !== 'configured') return;
-  speaker.decoder.decode(new EncodedAudioChunk({
-    type: 'key', timestamp: (speaker.count++) * 20000, data: opus,
-  }));
-}
+// Each person's decoder (decoders.js): one that failed on a bad frame gives way to a new one.
+const decoders = new Decoders({
+  AudioDecoder: window.AudioDecoder, EncodedAudioChunk: window.EncodedAudioChunk, note,
+  play: (seat, audio) => {
+    const pcm = new Float32Array(audio.numberOfFrames);
+    if (audio.format.startsWith('f32')) {
+      audio.copyTo(pcm, { planeIndex: 0 });
+    } else {
+      const ints = new Int16Array(audio.numberOfFrames);
+      audio.copyTo(ints, { planeIndex: 0 });
+      for (let i = 0; i < ints.length; i++) pcm[i] = ints[i] / 32768;
+    }
+    audio.close();
+    if (state.playout) state.playout.port.postMessage({ seat, pcm }, [pcm.buffer]);
+  },
+});
 
 async function readStreams(session) {
   const streams = session.transport.incomingUnidirectionalStreams.getReader();
@@ -778,7 +719,12 @@ function stopAudio() {
   if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
   if (state.output) state.output.stop();
   if (state.context) state.context.close();
-  Object.assign(state, { encoder: null, context: null, stream: null, playout: null, output: null });
+  // The call is over for WebKit too: the lock screen's pause would otherwise mute the next one.
+  if (state.call) {
+    leaveLockScreen(navigator.mediaSession);
+    sayTheCallIsOver(navigator);
+  }
+  Object.assign(state, { encoder: null, context: null, stream: null, playout: null, output: null, call: false });
 }
 
 function leave() {
@@ -787,11 +733,8 @@ function leave() {
   state.ticking = null;
   wasm.jitter_clear();
   for (const key of sessions.keys()) close(key);
-  for (const speaker of state.decoders.values()) if (speaker.decoder.state !== 'closed') speaker.decoder.close();
-  state.decoders.clear();
+  decoders.close();
   stopAudio();
-  // The frame numbers go on counting: a listener's jitter buffer would take a speaker who starts
-  // again from 0 for frames long played, until it saw them start over.
   Object.assign(state, { current: null, roomState: null, seat: null });
   $('join').hidden = false;
   $('join').disabled = false;
@@ -845,11 +788,22 @@ document.addEventListener('visibilitychange', () => {
 async function boot() {
   const missing = missingFeatures();
   if (missing.length) return say('This browser can’t make the call. Open the link in Chrome or Edge on a computer.', true);
-  if (!readLink()) return say('This page needs the room’s link. Ask whoever set up the call for it.', true);
+  const link = readLink(location.hash.slice(1));
+  if (!link) return say('This page needs the room’s link. Ask whoever set up the call for it.', true);
+  const { tone, webaudio, invite, token, room, me } = link;
+  Object.assign(state, { link, tone, webaudio, invite, token, room, me });
   $('room').textContent = `Room ${state.room}`;
   note(`${navigator.userAgent}`);
   if (state.invite) {
-    state.person = personId();
+    state.people = 'BroadcastChannel' in window ? new BroadcastChannel('voice-person') : null;
+    state.person = await personId({
+      storage: () => sessionStorage,
+      channel: state.people,
+      random: () => crypto.getRandomValues(new BigUint64Array(1))[0],
+      // Another tab answers within milliseconds; this only holds up the Join button.
+      wait: () => new Promise((done) => setTimeout(done, 200)),
+      note,
+    });
     state.me = await personHash(state.person);
     note(`room ${state.room}, by its invite: you are ${state.me.toString(16).padStart(16, '0')} in its room state`);
   } else {
@@ -861,7 +815,10 @@ async function boot() {
     return say('The call isn’t set up right now: no voice servers are listed. Ask whoever set it up.', true);
   }
   note(`voice servers: ${state.relays.map((r) => r.key).join(', ')}`);
-  say('Ready. Press Join and allow the microphone.');
+  // Expired by this device's clock: the relays will refuse it. Join stays, in case the clock is
+  // wrong.
+  if (expired(state.link, Date.now())) say(EXPIRED, true);
+  else say('Ready. Press Join and allow the microphone.');
   $('join').disabled = false;
 }
 boot();

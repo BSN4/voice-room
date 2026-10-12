@@ -6,6 +6,7 @@
 // - the call plays through an <audio> element, which iOS lets play on in the background, rather
 //   than straight to Web Audio's output;
 // - the lock screen names the call, and its pause and play mute and unmute.
+// Leaving the call undoes the first and the last, so the next call starts as the first did.
 // Whether iOS then keeps the microphone and the connection going, a call on an iPhone shows:
 // the page notes each change (hidden, shown, audio interrupted, microphone muted).
 // Tested by background.test.js (`node --test web/*.test.js`), with stand-ins for the browser.
@@ -21,6 +22,12 @@ export function sayItIsACall(nav, note) {
     note(`could not tell the browser this is a call: ${why(error)}`);
     return false;
   }
+}
+
+// Tells WebKit the call is over: its audio session back to what a page has by default.
+export function sayTheCallIsOver(nav) {
+  if (!nav.audioSession) return;
+  try { nav.audioSession.type = 'auto'; } catch (_) { /* left as it is */ }
 }
 
 // Where the call plays: an <audio> element fed from Web Audio, or Web Audio's own output where
@@ -78,6 +85,16 @@ export function lockScreen(mediaSession, Metadata, { title, mute, unmute }) {
   handle('pause', () => { mute(); mediaSession.playbackState = 'paused'; });
   handle('play', () => { unmute(); mediaSession.playbackState = 'playing'; });
   mediaSession.playbackState = 'playing';
+}
+
+// The call is over: the lock screen's controls go, so its pause no longer mutes the next call.
+export function leaveLockScreen(mediaSession) {
+  if (!mediaSession) return;
+  for (const action of ['pause', 'play']) {
+    try { mediaSession.setActionHandler(action, null); } catch (_) { /* unknown action */ }
+  }
+  mediaSession.metadata = null;
+  mediaSession.playbackState = 'none';
 }
 
 const why = (error) => (error && (error.message || error.name)) || String(error);
