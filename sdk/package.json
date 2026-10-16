@@ -1,0 +1,16 @@
+{
+  "name": "voice-web-sdk",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Voice calls through the voice relays, headless: the client core and noise filter as WebAssembly, behind one module (ADR 0024).",
+  "type": "module",
+  "exports": {
+    ".": "./voice.js"
+  },
+  "files": [
+    "*.js",
+    "*.wasm",
+    "!*.test.js",
+    "!stand-ins*.js"
+  ]
+}

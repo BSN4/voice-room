@@ -4,32 +4,37 @@
 //
 // A duplicated tab copies the first one's sessionStorage, id and all: both would be one person,
 // on one seat. So a tab that finds an id kept asks the page's other tabs, over a
-// BroadcastChannel, whether one of them holds it, and takes a new one if so. A reload finds no
+// BroadcastChannel, whether one of them holds it, and takes a new one if so. They ask by a hash
+// of the id (ids.js, tabHash), never the id itself, which with the invite lets anyone in as this
+// person: the page's origin may be shared with other sites. A reload finds no
 // one: the page before it is gone. Two tabs that ask at once both take new ones. A tab the
 // browser froze in the background cannot answer, and then the two still share the id.
-// Tested by person.test.js (`node --test web/*.test.js`).
+// Tested by person.test.js (`node --test 'web/**/*.test.js'`).
 
 const KEY = 'voice-person';
 
 // storage(): the tab's sessionStorage, which may throw. channel: a BroadcastChannel the page's
 // tabs share, kept open for the page's life, or null. random(): a random u64, as a BigInt.
 // wait(): resolves once another tab has had time to answer. note(text): a line for the log.
-export async function personId({ storage, channel, random, wait, note }) {
+// hash(id): what the tabs compare instead of the id, resolving to a value they can match.
+export async function personId({ storage, channel, random, wait, note, hash }) {
   const kept = read(storage);
   let id = kept ?? keep(storage, random());
   if (!channel) return id;
+  let mine = String(await hash(id));
   let taken = false;
   channel.onmessage = ({ data }) => {
     if (!data) return;
-    if (data.ask === id.toString()) channel.postMessage({ taken: data.ask });
-    else if (data.taken === id.toString()) taken = true;
+    if (data.ask === mine) channel.postMessage({ taken: data.ask });
+    else if (data.taken === mine) taken = true;
   };
   if (kept === null) return id;
-  channel.postMessage({ ask: id.toString() });
+  channel.postMessage({ ask: mine });
   await wait();
   if (taken) {
     note('another tab of this page has this tab’s person id, as a duplicated tab does: a new one');
     id = keep(storage, random());
+    mine = String(await hash(id));
   }
   return id;
 }

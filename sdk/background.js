@@ -9,7 +9,9 @@
 // Leaving the call undoes the first and the last, so the next call starts as the first did.
 // Whether iOS then keeps the microphone and the connection going, a call on an iPhone shows:
 // the page notes each change (hidden, shown, audio interrupted, microphone muted).
-// Tested by background.test.js (`node --test web/*.test.js`), with stand-ins for the browser.
+// Tested by background.test.js (`node --test 'web/**/*.test.js'`), with stand-ins for the browser.
+
+import { why } from './shared.js';
 
 // Tells WebKit this page is a call: true if it could. Before any audio starts.
 export function sayItIsACall(nav, note) {
@@ -97,4 +99,3 @@ export function leaveLockScreen(mediaSession) {
   mediaSession.playbackState = 'none';
 }
 
-const why = (error) => (error && (error.message || error.name)) || String(error);

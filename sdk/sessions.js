@@ -1,32 +1,35 @@
 // The page's sessions, one per relay it is joining or joined at, by "ip:port". The client in
 // the WebAssembly decides which to open and which to leave; this keeps track of each, tells
 // the page when one is ready, fails or ends, and closes them. Tested by sessions.test.js
-// (`node --test web/*.test.js`), with a stand-in for the browser's WebTransport.
+// (`node --test 'web/**/*.test.js'`), with a stand-in for the browser's WebTransport.
 //
 // A session is never closed while it connects. Safari ignores that close and connects anyway,
 // and the relay then holds a session the page has forgotten: in a call, one page left dozens in
 // the room until its tab closed. One left while it connects is closed once it is ready.
 
+import { why } from './shared.js';
+
 export class Sessions {
-  // connect(url, hash): a WebTransport to `url`, pinning the certificate `hash`.
+  // connect(url, hash): a WebTransport to `url`, pinning the certificate `hash`, or nothing for
+  // a relay reached by name (null).
   // now(): milliseconds. note(text): a line for the log.
-  // ready(session), failed(session), closed(session): what happened, for the page to say.
+  // ready(session), failed(session), closed(session, ended): what happened, for the page to say.
+  // `ended` is the close code and reason the relay gave, { code, reason }, or null if it broke.
   constructor({ connect, now, note, ready, failed, closed }) {
     Object.assign(this, { connect, now, note, ready, failed, closed });
     this.open_ = new Map();
   }
 
-  has(key) { return this.open_.has(key); }
   get(key) { return this.open_.get(key); }
   keys() { return [...this.open_.keys()]; }
 
-  // Opens a session at `relay` ({ key, hash, … }) by `url`: the join.
+  // Opens a session at `relay` ({ key, hash, name, … }) by `url`: the join.
   open(relay, url) {
     if (this.open_.has(relay.key)) return;
     this.note(`connecting to ${relay.key}`);
     let transport;
     try {
-      transport = this.connect(url, relay.hash);
+      transport = this.connect(url, relay.name ? null : relay.hash);
     } catch (error) {
       this.note(`could not start a connection to ${relay.key}: ${why(error)}`);
       this.failed(relay);
@@ -50,15 +53,20 @@ export class Sessions {
       this.open_.delete(relay.key);
       this.failed(session);
     });
+    // How it ended: the close code and reason the relay gave, or null if it broke.
+    let ended = null;
     transport.closed.then(
-      (info) => this.note(`session at ${relay.key} closed${this.lasted(session)}: code ${info.closeCode}${info.reason ? `, ${info.reason}` : ''}`),
+      (info) => {
+        ended = { code: info.closeCode, reason: info.reason ?? '' };
+        this.note(`session at ${relay.key} closed${this.lasted(session)}: code ${info.closeCode}${info.reason ? `, ${info.reason}` : ''}`);
+      },
       (error) => this.note(session.connected
         ? `session at ${relay.key} broke${this.lasted(session)}: ${why(error)}`
         : `session at ${relay.key} never became ready: ${why(error)}`),
     ).finally(() => {
       if (this.open_.get(relay.key) !== session) return;
       this.open_.delete(relay.key);
-      this.closed(session);
+      this.closed(session, ended);
     });
   }
 
@@ -81,4 +89,3 @@ function shut(session) {
   try { session.transport.close({ closeCode: 0, reason: 'moved' }); } catch (_) { /* already closed */ }
 }
 
-export const why = (error) => (error && (error.message || error.name)) || String(error);
